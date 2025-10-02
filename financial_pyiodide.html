@@ -1,0 +1,363 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Financial Analyzer — Pyodide (PDF.js + OpenAI)</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+  <style>
+    .card { margin-bottom: 20px; }
+    .badge { font-size:12px; }
+    .monospace { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+<div class="container my-4">
+  <div class="card">
+    <div class="card-body">
+      <h4 class="card-title">1) Upload Financial Statement PDF
+        <span id="ctx-pill" class="badge text-bg-secondary ms-2">Context: False</span>
+      </h4>
+      <div class="row g-2 align-items-center">
+        <div class="col-auto"><input class="form-control" id="pdf-input" type="file" accept="application/pdf"></div>
+        <div class="col-auto"><button class="btn btn-primary" id="analyze-btn">Analyze</button></div>
+        <div class="col-auto"><button class="btn btn-outline-secondary" id="clear-btn">Clear context</button></div>
+        <div class="col-auto"><button class="btn btn-outline-dark" id="debug-btn">Debug</button></div>
+      </div>
+      <div id="upload-error" class="text-danger mt-2" hidden></div>
+    </div>
+  </div>
+
+  <div id="metrics-card" class="card mb-3" hidden>
+    <div class="card-body">
+      <h3 class="card-title">Extracted Metrics</h3>
+      <div class="row">
+        <div class="col-md-7">
+          <h5>Income Statement (Current vs Prior)</h5>
+          <table class="table table-sm table-striped align-middle" id="dual-table">
+            <thead><tr><th>Line</th><th class="text-end">Current</th><th class="text-end">Prior</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="col-md-5">
+          <h5>Other Key Balances</h5>
+          <table class="table table-sm table-striped" id="single-table">
+            <thead><tr><th>Item</th><th class="text-end">Value</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="ratios-card" class="card mb-3" hidden>
+    <div class="card-body">
+      <h3 class="card-title">Ratios</h3>
+      <ul id="ratios-list" class="mb-3"></ul>
+      <div id="recs-wrap" hidden>
+        <h5>Recommendations</h5>
+        <ul id="recs-list"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-body">
+      <h3 class="card-title">2) Chat with OpenAI about this PDF</h3>
+      <div class="text-secondary" id="no-ctx-hint">Upload a PDF first to give the assistant context. You can still type a question—I'll remind you.</div>
+      <textarea class="form-control" id="prompt" rows="5" placeholder="Ask about profitability, cost efficiency, credit quality, etc."></textarea>
+      <div class="mt-3">
+        <button class="btn btn-primary" id="ask-btn">Ask</button>
+      </div>
+      <hr/>
+      <div><b>Assistant:</b></div>
+      <div id="answer" class="monospace"></div>
+      <div id="chat-error" class="text-danger mt-2" hidden></div>
+    </div>
+  </div>
+</div>
+
+<!-- PDF.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<!-- Pyodide -->
+<script src="https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js"></script>
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+let pyodideReady = (async () => {
+  const pyCode = String.raw`
+import re, json
+
+def to_float(s):
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return None
+
+def safe_div(a, b):
+    return round(a / b, 4) if a is not None and b not in (None, 0) else None
+
+def fmt_pct(x):
+    return f"{x*100:.2f}%" if x is not None else "N/A"
+
+patterns_dual = {
+    "Total Operating Income": r"Total operating income\\s+([\\d,]+)\\s+([\\d,]+)",
+    "General and Administrative Expenses": r"General and administrative expenses\\s+\\(([\\d,]+)\\)\\s+\\(([\\d,]+)\\)",
+    "Operating Profit Before Impairment": r"Operating profit before impairment\\s+([\\d,]+)\\s+([\\d,]+)",
+    "Profit Before Tax": r"Profit for the period before taxation\\s+([\\d,]+)\\s+([\\d,]+)",
+    "Taxation Charge": r"Taxation charge\\s+\\(([\\d,]+)\\)\\s+\\(([\\d,]+)\\)",
+    "Profit for the Period": r"Profit for the period\\s+([\\d,]+)\\s+([\\d,]+)",
+    "Earnings Per Share (AED)": r"Earnings per share\\s*\\(AED\\)\\s+([\\d\\.]+)\\s+([\\d\\.]+)",
+}
+patterns_single = {
+    "Gross Loans": r"Gross loans and receivables\\s+([\\d,]+)\\s+[\\d,]+",
+    "ECL": r"Less:\\s*Expected credit losses\\s+\\(([\\d,]+)\\)\\s+\\([\\d,]+\\)",
+    "NPLs": r"Total of credit impaired loans and receivables\\s+([\\d,]+)\\s+[\\d,]+",
+    "Total Assets": r"Segment Assets[\\s\\S]*?(\\d{1,3}(?:,\\d{3})+)\\s*\\n\\s*Segment Liabilities",
+}
+
+def extract_dual(text):
+    out = {}
+    for k, p in patterns_dual.items():
+        m = re.search(p, text, re.I)
+        out[k] = {
+            "current": to_float(m.group(1)) if m else None,
+            "prior": to_float(m.group(2)) if (m and m.lastindex and m.lastindex >= 2) else None,
+        }
+    return out
+
+def extract_single(text):
+    out = {}
+    for k, p in patterns_single.items():
+        m = re.search(p, text, re.I)
+        out[k] = to_float(m.group(1)) if m else None
+    return out
+
+def compute_ratios(dual, single):
+    toi = dual["Total Operating Income"]["current"]
+    ga  = dual["General and Administrative Expenses"]["current"]
+    opb = dual["Operating Profit Before Impairment"]["current"]
+    pat = dual["Profit for the Period"]["current"]
+    pbt = dual["Profit Before Tax"]["current"]
+    tax = dual["Taxation Charge"]["current"]
+    eps_c = dual["Earnings Per Share (AED)"]["current"]
+    eps_p = dual["Earnings Per Share (AED)"]["prior"]
+
+    gross  = single["Gross Loans"]
+    ecl    = single["ECL"]
+    npl    = single["NPLs"]
+    assets = single["Total Assets"]
+
+    return [
+        ("Cost-to-Income",        safe_div(ga, toi)),
+        ("Net Profit Margin",     safe_div(pat, toi)),
+        ("Pre-impairment Margin", safe_div(opb, toi)),
+        ("NPL Ratio",             safe_div(npl, gross)),
+        ("Coverage Ratio",        safe_div(ecl, npl)),
+        ("ECL/Gross Loans",       safe_div(ecl, gross)),
+        ("Tax Rate",              safe_div(tax, pbt)),
+        ("ROA",                   safe_div(pat, assets)),
+        ("EPS YoY",               safe_div((eps_c - eps_p) if (eps_c is not None and eps_p) else None, eps_p)),
+    ]
+
+def metrics_to_context(dual, single, ratios):
+    lines = ["Key metrics & ratios:"]
+    for k, v in dual.items():
+        lines.append(f"{k}: current={v['current']}, prior={v['prior']}")
+    for k, v in single.items():
+        lines.append(f"{k}: {v}")
+    lines.append("Ratios:")
+    for name, val in ratios:
+        lines.append(f"{name}: {fmt_pct(val)}")
+    return "\\n".join(lines)
+
+def analyze_text(text):
+    dual = extract_dual(text)
+    single = extract_single(text)
+    ratios = compute_ratios(dual, single)
+    ctx = metrics_to_context(dual, single, ratios)
+    return json.dumps({
+        'dual': dual,
+        'single': single,
+        'ratios': ratios,
+        'context': ctx
+    })
+`;
+  const pyodide = await loadPyodide();
+  await pyodide.runPythonAsync(pyCode);
+  return pyodide;
+})();
+
+async function extractPdfText(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  let fullText = '';
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    fullText += tc.items.map(i=>i.str).join(' ') + '\n';
+  }
+  return fullText;
+}
+
+let analysis = null;
+
+function fmtNum(x){
+  if(x === null || x === undefined) return 'N/A';
+  const n = Number(x);
+  return isFinite(n) ? n.toLocaleString(undefined,{minimumFractionDigits:2, maximumFractionDigits:2}) : String(x);
+}
+function fmtPct(x){
+  if(x === null || x === undefined) return 'N/A';
+  const n = Number(x);
+  return isFinite(n) ? (n*100).toFixed(2) + '%' : 'N/A';
+}
+function rebuildTables(){
+  if(!analysis) return;
+  const dualBody = document.querySelector('#dual-table tbody');
+  const singleBody = document.querySelector('#single-table tbody');
+  dualBody.innerHTML = '';
+  singleBody.innerHTML = '';
+
+  Object.entries(analysis.dual).forEach(([k,v])=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${k}</b></td><td class="text-end">${fmtNum(v.current)}</td><td class="text-end">${fmtNum(v.prior)}</td>`;
+    dualBody.appendChild(tr);
+  });
+
+  Object.entries(analysis.single).forEach(([k,v])=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${k}</b></td><td class="text-end">${fmtNum(v)}</td>`;
+    singleBody.appendChild(tr);
+  });
+
+  document.getElementById('metrics-card').hidden = false;
+}
+function rebuildRatios(){
+  if(!analysis) return;
+  const list = document.getElementById('ratios-list');
+  list.innerHTML = '';
+  (analysis.ratios || []).forEach(([name,val])=>{
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="kpi">${name}</span>: ${fmtPct(val)}`;
+    list.appendChild(li);
+  });
+
+  const d = Object.fromEntries(analysis.ratios || []);
+  const recs = [];
+  if(d['Cost-to-Income'] != null && d['Cost-to-Income'] > 0.50){
+    recs.push('High cost-to-income; review operating expenses.');
+  }
+  if(d['NPL Ratio'] != null && d['NPL Ratio'] > 0.06){
+    recs.push('NPL ratio elevated; examine credit concentrations.');
+  }
+  const wrap = document.getElementById('recs-wrap');
+  const ul = document.getElementById('recs-list');
+  ul.innerHTML = '';
+  if(recs.length){
+    recs.forEach(r=>{ const li = document.createElement('li'); li.textContent = r; ul.appendChild(li); });
+    wrap.hidden = false;
+  } else {
+    wrap.hidden = true;
+  }
+
+  document.getElementById('ratios-card').hidden = false;
+}
+function setContextPill(has){
+  const pill = document.getElementById('ctx-pill');
+  pill.textContent = 'Context: ' + (has ? 'True' : 'False');
+  pill.classList.toggle('text-bg-success', !!has);
+  pill.classList.toggle('text-bg-secondary', !has);
+  document.getElementById('no-ctx-hint').style.display = has ? 'none' : 'block';
+}
+
+document.getElementById('analyze-btn').addEventListener('click', async ()=>{
+  const file = document.getElementById('pdf-input').files?.[0];
+  const err = document.getElementById('upload-error');
+  err.hidden = true; err.textContent = '';
+  if(!file){ err.hidden = false; err.textContent = 'Please select a PDF.'; return; }
+
+  const btn = document.getElementById('analyze-btn');
+  const old = btn.innerHTML; btn.innerHTML = '<span class="spinner"></span> Analyzing…'; btn.disabled = true;
+  try{
+    const text = await extractPdfText(file);
+    const pyodide = await pyodideReady;
+    const code = `analyze_text(${JSON.stringify(text)})`;
+    const resultJson = await pyodide.runPythonAsync(code);
+    analysis = JSON.parse(resultJson);
+    rebuildTables();
+    rebuildRatios();
+    setContextPill(true);
+    localStorage.setItem('fin_context', analysis.context);
+  }catch(e){
+    console.error(e);
+    err.hidden = false; err.textContent = 'Parse error: ' + (e?.message || String(e));
+  }finally{
+    btn.innerHTML = old; btn.disabled = false;
+  }
+});
+
+document.getElementById('clear-btn').addEventListener('click', ()=>{
+  analysis = null;
+  document.getElementById('metrics-card').hidden = true;
+  document.getElementById('ratios-card').hidden = true;
+  setContextPill(false);
+  localStorage.removeItem('fin_context');
+});
+
+document.getElementById('debug-btn').addEventListener('click', ()=>{
+  const ctx = analysis?.context || '(no context)';
+  alert(ctx);
+});
+
+document.getElementById('ask-btn').addEventListener('click', async ()=>{
+  const prompt = document.getElementById('prompt').value.trim();
+  const context = analysis?.context || localStorage.getItem('fin_context') || '';
+  const answerEl = document.getElementById('answer');
+  const chatErrEl = document.getElementById('chat-error');
+  chatErrEl.hidden = true; chatErrEl.textContent='';
+  answerEl.textContent = '';
+  if(!prompt){ return; }
+  if(!context){
+    document.getElementById('no-ctx-hint').style.display = 'block';
+  }
+  const sys = 'You are a bank financial analyst. Be concise and numeric.';
+  const user = context ? `${context}\n\nUser prompt: ${prompt}` : prompt;
+  const btn = document.getElementById('ask-btn');
+  const old = btn.innerHTML; btn.innerHTML = '<span class="spinner"></span> Asking…'; btn.disabled = true;
+  try{
+    // You must provide your OpenAI API key here
+    const apiKey = ''; // <-- Put your OpenAI API key here
+    if(!apiKey){ chatErrEl.hidden=false; chatErrEl.textContent='Please enter your OpenAI API key in the code.'; return; }
+    const resp = await fetch('https://api.openai.com/v1/chat/completions',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'Authorization':`Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages:[{role:'system', content: sys},{role:'user', content: user}],
+        temperature: 0.2
+      })
+    });
+    if(!resp.ok){
+      const t = await resp.text();
+      throw new Error(`OpenAI HTTP ${resp.status}: ${t}`);
+    }
+    const data = await resp.json();
+    answerEl.textContent = (data.choices?.[0]?.message?.content || '').trim();
+  }catch(e){
+    console.error(e);
+    chatErrEl.hidden = false; chatErrEl.textContent = e.message || String(e);
+  }finally{
+    btn.innerHTML = old; btn.disabled = false;
+  }
+});
+
+setContextPill(false);
+</script>
+</body>
+</html>
