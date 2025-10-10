@@ -2,3 +2,5 @@ Flask
 python-dotenv
 PyMuPDF
 openai
+pillow
+pytesseract
