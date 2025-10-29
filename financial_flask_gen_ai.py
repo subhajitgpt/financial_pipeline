@@ -583,5 +583,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--cli":
         cli_chat()
     else:
-        print("Financial app on http://127.0.0.1:5069")
-        app.run(host="127.0.0.1", port=5069, debug=True, use_reloader=False)
+        print("Financial app on http://127.0.0.1:5079")
+        app.run(host="127.0.0.1", port=5079, debug=True, use_reloader=False)

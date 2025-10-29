@@ -444,7 +444,7 @@ TEMPLATE = """
 <div class="container my-4">
   <div class="card">
     <div class="card-body">
-      <h4 class="card-title">1) Upload HDFC Financial Statement PDF
+      <h4 class="card-title">1) Upload Financial Statement PDF
         {% if has_context %}
           <span class="badge text-bg-success ms-2">Context: True</span>
         {% else %}
@@ -757,5 +757,5 @@ def test_pdf():
 if __name__ == "__main__":
     ok, msg = check_ocr_dependencies()
     print(("✅ " if ok else "⚠️ ") + msg)
-    print("HDFC Financial Analyzer on http://127.0.0.1:5073")
-    app.run(host="127.0.0.1", port=5073, debug=True, use_reloader=False)
+    print("HDFC Financial Analyzer on http://127.0.0.1:5075")
+    app.run(host="127.0.0.1", port=5075, debug=True, use_reloader=False)
