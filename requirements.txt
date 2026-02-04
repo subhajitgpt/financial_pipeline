@@ -4,3 +4,9 @@ PyMuPDF
 openai
 pillow
 pytesseract
+PyPDF2
+sentence-transformers==2.2.2
+transformers==4.30.2
+faiss-cpu
+numpy
+torch

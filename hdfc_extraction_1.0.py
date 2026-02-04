@@ -1236,10 +1236,10 @@ if __name__ == "__main__":
     ok, msg = check_ocr_dependencies()
     print(("✅ " if ok else "⚠️ ") + msg)
     print("🏦 HDFC Financial Analyzer with ChatGPT-style AI Assistant")
-    print("🌐 Running on http://127.0.0.1:5077")
+    print("🌐 Running on http://127.0.0.1:5071")
     print("🤖 Powered by GPT-4.1")
     if OPENAI_API_KEY:
         print("🔐 OpenAI API key decrypted from environment.")
     else:
         print("⚠️ OpenAI API key missing or decryption failed. Check OPENAI_API_KEY_ENCRYPTED / OPENAI_PASSPHRASE.")
-    app.run(host="127.0.0.1", port=5077, debug=True, use_reloader=False)
+    app.run(host="127.0.0.1", port=5071, debug=True, use_reloader=False)
