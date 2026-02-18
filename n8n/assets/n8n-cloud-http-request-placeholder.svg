@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560">
+  <rect width="1200" height="560" fill="#ffffff"/>
+  <text x="40" y="60" font-family="Segoe UI, Arial" font-size="28" fill="#111">HTTP Request node settings (placeholder screenshot)</text>
+
+  <rect x="60" y="100" width="1080" height="400" rx="18" fill="#f7f7f7" stroke="#cfcfcf"/>
+
+  <text x="100" y="165" font-family="Segoe UI, Arial" font-size="18" fill="#111">Method: POST</text>
+  <text x="100" y="205" font-family="Segoe UI, Arial" font-size="18" fill="#111">URL: https://&lt;YOUR_SERVICE&gt;/api/analyze</text>
+  <text x="100" y="245" font-family="Segoe UI, Arial" font-size="18" fill="#111">Send Body: Form-Data (multipart)</text>
+  <text x="100" y="300" font-family="Segoe UI, Arial" font-size="18" fill="#111">Fields:</text>
+  <text x="140" y="340" font-family="Segoe UI, Arial" font-size="18" fill="#111">- llm: 0 (or 1)</text>
+  <text x="140" y="380" font-family="Segoe UI, Arial" font-size="18" fill="#111">- pdf_files: (file from webhook binary)</text>
+
+  <text x="100" y="455" font-family="Segoe UI, Arial" font-size="16" fill="#444">Replace this file with a real screenshot from your n8n Cloud UI if desired.</text>
+</svg>
