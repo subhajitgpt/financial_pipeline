@@ -1791,8 +1791,7 @@ TEMPLATE = """
 
             <div class="tab-content pt-3">
                 <div class="tab-pane fade show active" id="tab-summary" role="tabpanel" aria-labelledby="tab-summary-btn">
-                    {% set rec = result.final_recommendation_struct or {} %}
-                    <div class="card p-3 mb-3">
+                    <div class="card p-3 p-md-4 mb-3">
                         <div class="row g-3 align-items-stretch">
                             <div class="col-lg-7">
                                 <div class="af-hero h-100">
@@ -1801,7 +1800,7 @@ TEMPLATE = """
                                             <div class="text-muted small">Recommended organisation</div>
                                             <div class="d-flex align-items-end gap-2 flex-wrap">
                                                 <div class="af-hero-value">{{ result.recommended_organisation or '—' }}</div>
-                                                {% if result.recommended_organisation and not (rec and rec.recommended and rec.recommended == result.recommended_organisation) %}
+                                                {% if result.recommended_organisation %}
                                                     <span class="badge text-bg-primary">Top match</span>
                                                 {% endif %}
                                             </div>
@@ -1836,6 +1835,7 @@ TEMPLATE = """
                             </div>
                         </div>
 
+                        {% set rec = result.final_recommendation_struct or {} %}
                         {% if rec and rec.recommended %}
                             <hr/>
                             <div class="text-muted mb-2">Recommendation</div>
@@ -1930,7 +1930,7 @@ TEMPLATE = """
                         {% endif %}
                     </div>
 
-                    <div class="card p-3 mb-3">
+                    <div class="card p-3 p-md-4 mb-3">
                         <div class="text-muted mb-2">Per-PDF details</div>
                         {% for r in result.results %}
                             <details class="mb-2">
@@ -2028,7 +2028,7 @@ TEMPLATE = """
                 </div>
 
                 <div class="tab-pane fade" id="tab-metrics" role="tabpanel" aria-labelledby="tab-metrics-btn">
-                    <div class="card p-3 mb-3">
+                    <div class="card p-3 p-md-4 mb-3">
                         <div class="d-flex justify-content-between flex-wrap gap-2 align-items-end mb-2">
                             <div>
                                 <div class="text-muted">Organisation key metrics</div>
@@ -2068,7 +2068,7 @@ TEMPLATE = """
                         <div class="form-text">Metrics are computed from the winner extractor per PDF.</div>
                     </div>
 
-                    <div class="card p-3 mb-3">
+                    <div class="card p-3 p-md-4 mb-3">
                         <div class="text-muted mb-2">Strengths & weaknesses (relative comparison)</div>
                         {% for org, d in result.organisations.items() %}
                             <div class="mb-3">
@@ -2109,7 +2109,7 @@ TEMPLATE = """
                         {% endfor %}
                     </div>
 
-                    <div class="card p-3 mb-3">
+                    <div class="card p-3 p-md-4 mb-3">
                         <div class="text-muted mb-2">Per-PDF key metrics (winner-based)</div>
                         <div class="af-table-wrap">
                         <div class="table-responsive">
