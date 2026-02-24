@@ -1267,7 +1267,7 @@ TEMPLATE = """
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
     <meta name="theme-color" content="#10a37f"/>
-    <title>financebit</title>
+    <title>Financial Statement Analyzer and Recommendation Agent</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -1483,7 +1483,8 @@ TEMPLATE = """
         .af-metrics-card { padding: 18px; }
         .af-metrics-head {
             display: flex;
-            align-items: baseline;
+            /* Use top alignment so the right-side pill stays aligned even when subtitles wrap */
+            align-items: flex-start;
             justify-content: space-between;
             gap: 12px;
             flex-wrap: wrap;
@@ -1798,12 +1799,10 @@ TEMPLATE = """
                                 <div class="af-hero h-100">
                                     <div class="d-flex justify-content-between gap-3 flex-wrap">
                                         <div>
-                                            <div class="text-muted small">Recommended organisation</div>
+                                            {% set org_names = (result.organisations|list) if result.organisations else [] %}
+                                            <div class="text-muted small">Organisations analyzed</div>
                                             <div class="d-flex align-items-end gap-2 flex-wrap">
-                                                <div class="af-hero-value">{{ result.recommended_organisation or '—' }}</div>
-                                                {% if result.recommended_organisation and not (rec and rec.recommended and rec.recommended == result.recommended_organisation) %}
-                                                    <span class="badge text-bg-primary">Top match</span>
-                                                {% endif %}
+                                                <div class="af-hero-value">{% if org_names and org_names|length > 0 %}{{ org_names|join(' vs ') }}{% else %}—{% endif %}</div>
                                             </div>
                                             <div class="text-muted">PDFs analyzed: <span class="mono">{{ result.pdf_count }}</span></div>
                                         </div>
@@ -2029,16 +2028,17 @@ TEMPLATE = """
 
                 <div class="tab-pane fade" id="tab-metrics" role="tabpanel" aria-labelledby="tab-metrics-btn">
                     <div class="card p-3 mb-3">
-                        <div class="d-flex justify-content-between flex-wrap gap-2 align-items-end mb-2">
-                            <div>
-                                <div class="text-muted">Organisation key metrics</div>
-                                <div class="text-muted small">Averaged across uploaded PDFs (winner-based)</div>
+                        <div class="af-metrics-card">
+                            <div class="af-metrics-head">
+                                <div>
+                                    <h4 class="af-block-title mb-1"><i class="fa-solid fa-chart-simple"></i>Organisation Key Metrics</h4>
+                                    <div class="af-block-subtitle">Averaged across uploaded PDFs (winner-based)</div>
+                                </div>
+                                <div class="af-units-pill"><i class="fa-solid fa-circle-info"></i>Missing values shown as —</div>
                             </div>
-                            <div class="text-muted small">Missing values shown as —</div>
-                        </div>
-                        <div class="af-table-wrap">
-                        <div class="table-responsive">
-                            <table class="table table-sm align-middle">
+                            <div class="af-table-wrap">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle af-table mb-0">
                                 <thead>
                                     <tr>
                                         <th>Organisation</th>
@@ -2063,57 +2063,73 @@ TEMPLATE = """
                                     {% endfor %}
                                 </tbody>
                             </table>
+                            </div>
+                            </div>
+                            <div class="form-text">Metrics are computed from the winner extractor per PDF.</div>
                         </div>
-                        </div>
-                        <div class="form-text">Metrics are computed from the winner extractor per PDF.</div>
                     </div>
 
                     <div class="card p-3 mb-3">
-                        <div class="text-muted mb-2">Strengths & weaknesses (relative comparison)</div>
-                        {% for org, d in result.organisations.items() %}
-                            <div class="mb-3">
-                                <div class="h6 mb-1">{{ org }}</div>
-                                {% set sw = (result.insights.strengths_weaknesses or {}).get(org) %}
-                                <div class="row g-3">
-                                    <div class="col-md-6">
-                                        <div class="af-sw-box">
-                                        <div class="text-muted">Strengths</div>
-                                        {% if sw and sw.strengths and sw.strengths|length > 0 %}
-                                            <ul class="af-list mt-2">
-                                                {% for s in sw.strengths %}
-                                                    <li><i class="fa-solid fa-circle-check"></i><div>{{ s }}</div></li>
-                                                {% endfor %}
-                                            </ul>
-                                        {% else %}
-                                            <div class="mono mt-2">No strong differentiators found (or insufficient data).</div>
-                                        {% endif %}
+                        <div class="af-metrics-card">
+                            <div class="af-metrics-head">
+                                <div>
+                                    <h4 class="af-block-title mb-1"><i class="fa-solid fa-thumbs-up"></i>Strengths & Weaknesses</h4>
+                                    <div class="af-block-subtitle">Relative comparison across organisations</div>
+                                </div>
+                                <div class="af-units-pill"><i class="fa-solid fa-scale-balanced"></i>Winner-based</div>
+                            </div>
+                            {% for org, d in result.organisations.items() %}
+                                <div class="mb-3">
+                                    <div class="h6 mb-1">{{ org }}</div>
+                                    {% set sw = (result.insights.strengths_weaknesses or {}).get(org) %}
+                                    <div class="row g-3">
+                                        <div class="col-md-6">
+                                            <div class="af-sw-box">
+                                            <div class="text-muted">Strengths</div>
+                                            {% if sw and sw.strengths and sw.strengths|length > 0 %}
+                                                <ul class="af-list mt-2">
+                                                    {% for s in sw.strengths %}
+                                                        <li><i class="fa-solid fa-circle-check"></i><div>{{ s }}</div></li>
+                                                    {% endfor %}
+                                                </ul>
+                                            {% else %}
+                                                <div class="mono mt-2">No strong differentiators found (or insufficient data).</div>
+                                            {% endif %}
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <div class="af-sw-box">
-                                        <div class="text-muted">Weaknesses</div>
-                                        {% if sw and sw.weaknesses and sw.weaknesses|length > 0 %}
-                                            <ul class="af-list mt-2">
-                                                {% for w in sw.weaknesses %}
-                                                    <li><i class="fa-solid fa-circle-xmark"></i><div>{{ w }}</div></li>
-                                                {% endfor %}
-                                            </ul>
-                                        {% else %}
-                                            <div class="mono mt-2">No clear weaknesses found (or insufficient data).</div>
-                                        {% endif %}
+                                        <div class="col-md-6">
+                                            <div class="af-sw-box">
+                                            <div class="text-muted">Weaknesses</div>
+                                            {% if sw and sw.weaknesses and sw.weaknesses|length > 0 %}
+                                                <ul class="af-list mt-2">
+                                                    {% for w in sw.weaknesses %}
+                                                        <li><i class="fa-solid fa-circle-xmark"></i><div>{{ w }}</div></li>
+                                                    {% endfor %}
+                                                </ul>
+                                            {% else %}
+                                                <div class="mono mt-2">No clear weaknesses found (or insufficient data).</div>
+                                            {% endif %}
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
-                            </div>
-                            {% if not loop.last %}<hr/>{% endif %}
-                        {% endfor %}
+                                {% if not loop.last %}<hr/>{% endif %}
+                            {% endfor %}
+                        </div>
                     </div>
 
                     <div class="card p-3 mb-3">
-                        <div class="text-muted mb-2">Per-PDF key metrics (winner-based)</div>
-                        <div class="af-table-wrap">
-                        <div class="table-responsive">
-                            <table class="table table-sm align-middle">
+                        <div class="af-metrics-card">
+                            <div class="af-metrics-head">
+                                <div>
+                                    <h4 class="af-block-title mb-1"><i class="fa-solid fa-table"></i>Per-PDF Key Metrics</h4>
+                                    <div class="af-block-subtitle">Winner-based ratios for each uploaded PDF</div>
+                                </div>
+                                <div class="af-units-pill"><i class="fa-solid fa-clipboard-check"></i>Missing values shown as —</div>
+                            </div>
+                            <div class="af-table-wrap">
+                            <div class="table-responsive">
+                                <table class="table table-sm align-middle af-table mb-0">
                                 <thead>
                                     <tr>
                                         <th>PDF</th>
@@ -2136,7 +2152,8 @@ TEMPLATE = """
                                     {% endfor %}
                                 </tbody>
                             </table>
-                        </div>
+                            </div>
+                            </div>
                         </div>
                     </div>
                 </div>
