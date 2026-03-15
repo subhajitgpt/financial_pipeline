@@ -1,0 +1,189 @@
+{
+  "name": "Financial Statement Upload Webhook - Full Financial Metrics + Google Sheets",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "financial-statement-upload",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "3bd6ee15-5f59-4002-a552-5c88419a46d3",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "financial-statement-upload"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body || {};\nconst binary = $binary || {};\nconst fileKey = binary.pdf_file ? 'pdf_file' : (binary.data ? 'data' : null);\n\nlet parsedPdfMetrics = {};\nlet parsedFinancialDetails = {};\n\nif (body.pdf_metrics_json) {\n  try {\n    parsedPdfMetrics = JSON.parse(body.pdf_metrics_json);\n  } catch (e) {\n    parsedPdfMetrics = {\n      parse_error: String(e),\n      raw_value: body.pdf_metrics_json\n    };\n  }\n}\n\nif (body.financial_details_json) {\n  try {\n    parsedFinancialDetails = JSON.parse(body.financial_details_json);\n  } catch (e) {\n    parsedFinancialDetails = {\n      parse_error: String(e),\n      raw_value: body.financial_details_json\n    };\n  }\n}\n\nfunction getNested(obj, path, fallback = '') {\n  try {\n    let cur = obj;\n    for (const p of path) {\n      if (cur == null || !(p in cur)) return fallback;\n      cur = cur[p];\n    }\n    return cur ?? fallback;\n  } catch (e) {\n    return fallback;\n  }\n}\n\n// --- agentic_flow.py payload support ---\n// The Flask UI posts JSON like: { sent_at, source, result }\nif (body && body.result && typeof body.result === 'object') {\n  const result = body.result || {};\n  const orgs = result.organisations || {};\n\n  let recommended = result.recommended_organisation || '';\n  if (!recommended && orgs && typeof orgs === 'object') {\n    const keys = Object.keys(orgs);\n    if (keys.length) {\n      keys.sort((a, b) => {\n        const A = orgs[a] || {};\n        const B = orgs[b] || {};\n        const ap = Number(A.avg_perf_score || 0);\n        const bp = Number(B.avg_perf_score || 0);\n        if (bp !== ap) return bp - ap;\n        const ae = Number(A.avg_extraction_score || 0);\n        const be = Number(B.avg_extraction_score || 0);\n        if (be !== ae) return be - ae;\n        const ac = Number(A.pdf_count || 0);\n        const bc = Number(B.pdf_count || 0);\n        return bc - ac;\n      });\n      recommended = keys[0] || '';\n    }\n  }\n\n  let runner_up = '';\n  try {\n    const names = Object.keys(orgs || {});\n    const others = names.filter((o) => o && o !== recommended);\n    if (recommended && others.length) {\n      others.sort((a, b) => Number((orgs[b] || {}).avg_perf_score || 0) - Number((orgs[a] || {}).avg_perf_score || 0));\n      runner_up = others[0] || '';\n    }\n  } catch (e) {}\n\n  const insights = result.insights || {};\n  const reasons = Array.isArray(insights.recommendation_reasons) ? insights.recommendation_reasons : [];\n  const sw = insights.strengths_weaknesses || {};\n  const rec_sw = (recommended && sw && typeof sw === 'object') ? (sw[recommended] || {}) : {};\n  const strengths = Array.isArray(rec_sw.strengths) ? rec_sw.strengths : [];\n  const weaknesses = Array.isArray(rec_sw.weaknesses) ? rec_sw.weaknesses : [];\n\n  const recOrg = (recommended && orgs && typeof orgs === 'object') ? (orgs[recommended] || {}) : {};\n  const metrics = (recOrg.metrics && typeof recOrg.metrics === 'object') ? recOrg.metrics : {};\n\n  const sentAt = body.sent_at || new Date().toISOString();\n  const source = body.source || 'agentic_flow_ui';\n  const pdfNames = Array.isArray(result.results)\n    ? result.results.map((x) => (x && (x.pdf_path || x.filename)) ? (x.pdf_path || x.filename) : '').filter(Boolean).join(' | ')\n    : '';\n\n  return [{\n    json: {\n      ok: true,\n      analysis_type: 'agentic_flow_result',\n      message: 'agentic_flow analysis received successfully in n8n.',\n      receivedAt: sentAt,\n      ingest_status: 'received_agentic_flow',\n      source: source,\n\n      company_name: body.company_name || '',\n      quarter: body.quarter || '',\n      industry: body.industry || '',\n      file_name: pdfNames,\n\n      recommended_organisation: recommended || '',\n      runner_up: runner_up || '',\n      recommendation_reasons: reasons.join(' | '),\n      strengths: strengths.join(' | '),\n      weaknesses: weaknesses.join(' | '),\n      pdf_count: String(result.pdf_count ?? ''),\n\n      ratio_net_profit_margin: (metrics.net_profit_margin ?? ''),\n      ratio_roa: (metrics.roa ?? ''),\n      ratio_roe: (metrics.roe ?? ''),\n      ratio_cost_to_income: (metrics.cost_to_income ?? ''),\n      ratio_npl_ratio: (metrics.asset_quality ?? ''),\n      ratio_loan_to_deposit: (metrics.loan_to_deposit ?? ''),\n\n      pdf_metrics_json: JSON.stringify({ sent_at: sentAt, source: source }),\n      financial_details_json: JSON.stringify(result),\n    }\n  }];\n}\n\nif (!fileKey) {\n  return [{\n    json: {\n      ok: false,\n      message: 'No PDF found. Send multipart/form-data with file field pdf_file or data.',\n      receivedAt: new Date().toISOString(),\n      company_name: body.company_name || '',\n      quarter: body.quarter || '',\n      industry: body.industry || '',\n      original_field_name: '',\n      file_name: '',\n      mime_type: '',\n      file_extension: '',\n      file_size: '',\n      ingest_status: 'failed_validation',\n\n      pdf_sha256: body.pdf_sha256 || parsedPdfMetrics.sha256 || '',\n      pdf_size_bytes: body.pdf_size_bytes || parsedPdfMetrics.file_size_bytes || '',\n      pdf_page_count: body.pdf_page_count || parsedPdfMetrics.page_count || '',\n      pdf_word_count_sampled: body.pdf_word_count_sampled || getNested(parsedPdfMetrics, ['text_stats', 'word_count'], ''),\n      pdf_metrics_json: body.pdf_metrics_json || '',\n      metrics_ingested_at: parsedPdfMetrics.ingested_at || '',\n      metrics_pdf_signature_ok: String(parsedPdfMetrics.pdf_signature_ok ?? ''),\n      metrics_chars: String(getNested(parsedPdfMetrics, ['text_stats', 'chars'], '')),\n      metrics_nonempty_line_count: String(getNested(parsedPdfMetrics, ['text_stats', 'nonempty_line_count'], '')),\n      metrics_number_token_count: String(getNested(parsedPdfMetrics, ['text_stats', 'number_token_count'], '')),\n      metrics_email_count: String(getNested(parsedPdfMetrics, ['text_stats', 'email_count'], '')),\n      metrics_url_count: String(getNested(parsedPdfMetrics, ['text_stats', 'url_count'], '')),\n      metrics_currency_mention_count: String(getNested(parsedPdfMetrics, ['text_stats', 'currency_mention_count'], '')),\n      metrics_image_count_in_sampled_pages: String(parsedPdfMetrics.image_count_in_sampled_pages ?? ''),\n      metrics_sampled_page_count: String(parsedPdfMetrics.sampled_page_count ?? ''),\n      metrics_preview_text: parsedPdfMetrics.preview_text || '',\n      metrics_metadata_json: JSON.stringify(parsedPdfMetrics.metadata || {}),\n\n      financial_details_json: body.financial_details_json || '',\n      fin_extracted_at: parsedFinancialDetails.extracted_at || '',\n      fin_sampled_page_count: String(parsedFinancialDetails.sampled_page_count ?? ''),\n      fin_units_currency: getNested(parsedFinancialDetails, ['units', 'currency'], ''),\n      fin_units_label: getNested(parsedFinancialDetails, ['units', 'units_label'], ''),\n      fin_found_items_count: String(getNested(parsedFinancialDetails, ['extraction_quality', 'found_items_count'], '')),\n      fin_has_income_statement: String(getNested(parsedFinancialDetails, ['extraction_quality', 'has_income_statement'], '')),\n      fin_has_balance_sheet: String(getNested(parsedFinancialDetails, ['extraction_quality', 'has_balance_sheet'], '')),\n\n      income_total_operating_income: body.income_total_operating_income || getNested(parsedFinancialDetails, ['income_statement', 'total_operating_income', 'current'], ''),\n      income_profit_for_period: body.income_profit_for_period || getNested(parsedFinancialDetails, ['income_statement', 'profit_for_period', 'current'], ''),\n      bs_total_assets: body.bs_total_assets || getNested(parsedFinancialDetails, ['balance_sheet', 'total_assets'], ''),\n      ratio_roa: body.ratio_roa || getNested(parsedFinancialDetails, ['computed_ratios', 'roa', 'value'], ''),\n      ratio_roe: body.ratio_roe || getNested(parsedFinancialDetails, ['computed_ratios', 'roe', 'value'], ''),\n      ratio_cost_to_income: body.ratio_cost_to_income || getNested(parsedFinancialDetails, ['computed_ratios', 'cost_to_income', 'value'], ''),\n      ratio_npl_ratio: body.ratio_npl_ratio || getNested(parsedFinancialDetails, ['computed_ratios', 'npl_ratio', 'value'], ''),\n      ratio_coverage_ratio: body.ratio_coverage_ratio || getNested(parsedFinancialDetails, ['computed_ratios', 'coverage_ratio', 'value'], ''),\n      ratio_loan_to_deposit: body.ratio_loan_to_deposit || getNested(parsedFinancialDetails, ['computed_ratios', 'loan_to_deposit', 'value'], ''),\n\n      income_net_interest_income: getNested(parsedFinancialDetails, ['income_statement', 'net_interest_income', 'current'], ''),\n      income_operating_profit_before_impairment: getNested(parsedFinancialDetails, ['income_statement', 'operating_profit_before_impairment', 'current'], ''),\n      income_profit_before_tax: getNested(parsedFinancialDetails, ['income_statement', 'profit_before_tax', 'current'], ''),\n      income_taxation: getNested(parsedFinancialDetails, ['income_statement', 'taxation', 'current'], ''),\n      income_eps: getNested(parsedFinancialDetails, ['income_statement', 'eps', 'current'], ''),\n      income_operating_expenses: getNested(parsedFinancialDetails, ['income_statement', 'operating_expenses', 'current'], ''),\n      bs_gross_loans: getNested(parsedFinancialDetails, ['balance_sheet', 'gross_loans'], ''),\n      bs_deposits: getNested(parsedFinancialDetails, ['balance_sheet', 'deposits'], ''),\n      bs_npls: getNested(parsedFinancialDetails, ['balance_sheet', 'npls'], ''),\n      bs_ecl: getNested(parsedFinancialDetails, ['balance_sheet', 'ecl'], ''),\n      bs_equity: getNested(parsedFinancialDetails, ['balance_sheet', 'equity'], ''),\n      ratio_net_profit_margin: getNested(parsedFinancialDetails, ['computed_ratios', 'net_profit_margin', 'value'], ''),\n      ratio_pre_impairment_margin: getNested(parsedFinancialDetails, ['computed_ratios', 'pre_impairment_margin', 'value'], ''),\n      ratio_tax_rate: getNested(parsedFinancialDetails, ['computed_ratios', 'tax_rate', 'value'], ''),\n      ratio_ecl_to_gross_loans: getNested(parsedFinancialDetails, ['computed_ratios', 'ecl_to_gross_loans', 'value'], ''),\n      reported_roa_percent: getNested(parsedFinancialDetails, ['reported_ratios', 'roa', 'as_percent'], ''),\n      reported_roe_percent: getNested(parsedFinancialDetails, ['reported_ratios', 'roe', 'as_percent'], '')\n    }\n  }];\n}\n\nconst file = binary[fileKey];\n\nreturn [{\n  json: {\n    ok: true,\n    message: 'PDF received successfully in n8n.',\n    receivedAt: new Date().toISOString(),\n    company_name: body.company_name || '',\n    quarter: body.quarter || '',\n    industry: body.industry || '',\n    original_field_name: fileKey,\n    file_name: file.fileName || '',\n    mime_type: file.mimeType || '',\n    file_extension: file.fileExtension || '',\n    file_size: file.fileSize || '',\n    ingest_status: 'received',\n\n    pdf_sha256: body.pdf_sha256 || parsedPdfMetrics.sha256 || '',\n    pdf_size_bytes: body.pdf_size_bytes || parsedPdfMetrics.file_size_bytes || file.fileSize || '',\n    pdf_page_count: body.pdf_page_count || parsedPdfMetrics.page_count || '',\n    pdf_word_count_sampled: body.pdf_word_count_sampled || getNested(parsedPdfMetrics, ['text_stats', 'word_count'], ''),\n    pdf_metrics_json: body.pdf_metrics_json || '',\n    metrics_ingested_at: parsedPdfMetrics.ingested_at || '',\n    metrics_pdf_signature_ok: String(parsedPdfMetrics.pdf_signature_ok ?? ''),\n    metrics_chars: String(getNested(parsedPdfMetrics, ['text_stats', 'chars'], '')),\n    metrics_nonempty_line_count: String(getNested(parsedPdfMetrics, ['text_stats', 'nonempty_line_count'], '')),\n    metrics_number_token_count: String(getNested(parsedPdfMetrics, ['text_stats', 'number_token_count'], '')),\n    metrics_email_count: String(getNested(parsedPdfMetrics, ['text_stats', 'email_count'], '')),\n    metrics_url_count: String(getNested(parsedPdfMetrics, ['text_stats', 'url_count'], '')),\n    metrics_currency_mention_count: String(getNested(parsedPdfMetrics, ['text_stats', 'currency_mention_count'], '')),\n    metrics_image_count_in_sampled_pages: String(parsedPdfMetrics.image_count_in_sampled_pages ?? ''),\n    metrics_sampled_page_count: String(parsedPdfMetrics.sampled_page_count ?? ''),\n    metrics_preview_text: parsedPdfMetrics.preview_text || '',\n    metrics_metadata_json: JSON.stringify(parsedPdfMetrics.metadata || {}),\n\n    financial_details_json: body.financial_details_json || '',\n    fin_extracted_at: parsedFinancialDetails.extracted_at || '',\n    fin_sampled_page_count: String(parsedFinancialDetails.sampled_page_count ?? ''),\n    fin_units_currency: getNested(parsedFinancialDetails, ['units', 'currency'], ''),\n    fin_units_label: getNested(parsedFinancialDetails, ['units', 'units_label'], ''),\n    fin_found_items_count: String(getNested(parsedFinancialDetails, ['extraction_quality', 'found_items_count'], '')),\n    fin_has_income_statement: String(getNested(parsedFinancialDetails, ['extraction_quality', 'has_income_statement'], '')),\n    fin_has_balance_sheet: String(getNested(parsedFinancialDetails, ['extraction_quality', 'has_balance_sheet'], '')),\n\n    income_total_operating_income: body.income_total_operating_income || getNested(parsedFinancialDetails, ['income_statement', 'total_operating_income', 'current'], ''),\n    income_profit_for_period: body.income_profit_for_period || getNested(parsedFinancialDetails, ['income_statement', 'profit_for_period', 'current'], ''),\n    bs_total_assets: body.bs_total_assets || getNested(parsedFinancialDetails, ['balance_sheet', 'total_assets'], ''),\n    ratio_roa: body.ratio_roa || getNested(parsedFinancialDetails, ['computed_ratios', 'roa', 'value'], ''),\n    ratio_roe: body.ratio_roe || getNested(parsedFinancialDetails, ['computed_ratios', 'roe', 'value'], ''),\n    ratio_cost_to_income: body.ratio_cost_to_income || getNested(parsedFinancialDetails, ['computed_ratios', 'cost_to_income', 'value'], ''),\n    ratio_npl_ratio: body.ratio_npl_ratio || getNested(parsedFinancialDetails, ['computed_ratios', 'npl_ratio', 'value'], ''),\n    ratio_coverage_ratio: body.ratio_coverage_ratio || getNested(parsedFinancialDetails, ['computed_ratios', 'coverage_ratio', 'value'], ''),\n    ratio_loan_to_deposit: body.ratio_loan_to_deposit || getNested(parsedFinancialDetails, ['computed_ratios', 'loan_to_deposit', 'value'], ''),\n\n    income_net_interest_income: getNested(parsedFinancialDetails, ['income_statement', 'net_interest_income', 'current'], ''),\n    income_operating_profit_before_impairment: getNested(parsedFinancialDetails, ['income_statement', 'operating_profit_before_impairment', 'current'], ''),\n    income_profit_before_tax: getNested(parsedFinancialDetails, ['income_statement', 'profit_before_tax', 'current'], ''),\n    income_taxation: getNested(parsedFinancialDetails, ['income_statement', 'taxation', 'current'], ''),\n    income_eps: getNested(parsedFinancialDetails, ['income_statement', 'eps', 'current'], ''),\n    income_operating_expenses: getNested(parsedFinancialDetails, ['income_statement', 'operating_expenses', 'current'], ''),\n    bs_gross_loans: getNested(parsedFinancialDetails, ['balance_sheet', 'gross_loans'], ''),\n    bs_deposits: getNested(parsedFinancialDetails, ['balance_sheet', 'deposits'], ''),\n    bs_npls: getNested(parsedFinancialDetails, ['balance_sheet', 'npls'], ''),\n    bs_ecl: getNested(parsedFinancialDetails, ['balance_sheet', 'ecl'], ''),\n    bs_equity: getNested(parsedFinancialDetails, ['balance_sheet', 'equity'], ''),\n    ratio_net_profit_margin: getNested(parsedFinancialDetails, ['computed_ratios', 'net_profit_margin', 'value'], ''),\n    ratio_pre_impairment_margin: getNested(parsedFinancialDetails, ['computed_ratios', 'pre_impairment_margin', 'value'], ''),\n    ratio_tax_rate: getNested(parsedFinancialDetails, ['computed_ratios', 'tax_rate', 'value'], ''),\n    ratio_ecl_to_gross_loans: getNested(parsedFinancialDetails, ['computed_ratios', 'ecl_to_gross_loans', 'value'], ''),\n    reported_roa_percent: getNested(parsedFinancialDetails, ['reported_ratios', 'roa', 'as_percent'], ''),\n    reported_roe_percent: getNested(parsedFinancialDetails, ['reported_ratios', 'roe', 'as_percent'], '')\n  },\n  binary: {\n    [fileKey]: file\n  }\n}];"
+      },
+      "id": "a76c1e11-7064-4a21-856b-5bbd612929bc",
+      "name": "Inspect Upload + Parse All Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ...$json } }];"
+      },
+      "id": "4df55b8e-9ed6-46eb-8836-2e3b602bea87",
+      "name": "Prepare Sheet Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1v51-IdymlYYGWlntaAlr5vdqk-qK61B3N3AOD5vW_cQ",
+          "mode": "list",
+          "cachedResultName": "data",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v51-IdymlYYGWlntaAlr5vdqk-qK61B3N3AOD5vW_cQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Sheet1",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v51-IdymlYYGWlntaAlr5vdqk-qK61B3N3AOD5vW_cQ/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "e5b3e1e8-f773-4727-bea8-4e4e841aa006",
+      "name": "Append to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        912,
+        0
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "dtfdUsBGd3EO4V1g",
+          "name": "Google Sheets account 4"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const src = $('Inspect Upload + Parse All Metrics').first().json;\n\nconst isAgentic = src && src.analysis_type === 'agentic_flow_result';\n\nreturn [{\n  json: {\n    ok: true,\n    message: isAgentic\n      ? 'agentic_flow analysis received successfully in n8n and logged to Google Sheets.'\n      : 'PDF received successfully in n8n and logged to Google Sheets.',\n    receivedAt: src.receivedAt,\n    analysis_type: src.analysis_type || (isAgentic ? 'agentic_flow_result' : 'pdf_upload'),\n\n    // Recommendation (agentic_flow path)\n    recommended_organisation: src.recommended_organisation || '',\n    runner_up: src.runner_up || '',\n    recommendation_reasons: src.recommendation_reasons || '',\n    strengths: src.strengths || '',\n    weaknesses: src.weaknesses || '',\n    pdf_count: src.pdf_count || '',\n\n    // Legacy sheet fields\n    company_name: src.company_name,\n    quarter: src.quarter,\n    industry: src.industry,\n    file_name: src.file_name,\n\n    // Ratios\n    ratio_net_profit_margin: src.ratio_net_profit_margin || '',\n    ratio_roa: src.ratio_roa,\n    ratio_roe: src.ratio_roe,\n    ratio_cost_to_income: src.ratio_cost_to_income,\n    ratio_npl_ratio: src.ratio_npl_ratio,\n    ratio_coverage_ratio: src.ratio_coverage_ratio,\n    ratio_loan_to_deposit: src.ratio_loan_to_deposit,\n\n    // PDF metadata (legacy path)\n    pdf_sha256: src.pdf_sha256,\n    pdf_page_count: src.pdf_page_count,\n    pdf_word_count_sampled: src.pdf_word_count_sampled,\n\n    // Line items (legacy path)\n    income_total_operating_income: src.income_total_operating_income,\n    income_profit_for_period: src.income_profit_for_period,\n    bs_total_assets: src.bs_total_assets,\n\n    sheet_update: 'success'\n  }\n}];"
+      },
+      "id": "85e8d4b7-9d02-4f2d-bee3-b362f90d2d00",
+      "name": "Prepare Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1184,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "6df013a6-b4de-4c67-9fae-3bad028807c0",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Inspect Upload + Parse All Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inspect Upload + Parse All Metrics": {
+      "main": [
+        [
+          {
+            "node": "Prepare Sheet Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Sheet Row": {
+      "main": [
+        [
+          {
+            "node": "Append to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Prepare Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "4fcb44a6-9a10-4dae-9881-473bc5c3e367",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ca02a887a43c0281642200ca32b11e281915b8d220ae308f2df433ea243d5e81"
+  },
+  "id": "reQV6xH5i5hARkFb",
+  "tags": []
+}
