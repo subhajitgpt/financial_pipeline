@@ -2078,7 +2078,7 @@ TEMPLATE = """
                     <button class="nav-link" id="tab-hdfc-btn" data-bs-toggle="tab" data-bs-target="#tab-hdfc" type="button" role="tab">HDFC</button>
                 </li>
                 <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="tab-n8n-btn" data-bs-toggle="tab" data-bs-target="#tab-n8n" type="button" role="tab">n8n</button>
+                    <button class="nav-link" id="tab-n8n-btn" data-bs-toggle="tab" data-bs-target="#tab-n8n" type="button" role="tab">Recommender Workflow</button>
                 </li>
             </ul>
 
@@ -2700,15 +2700,15 @@ TEMPLATE = """
                     <div class="card p-3 mb-3">
                         <div class="d-flex justify-content-between flex-wrap gap-2">
                             <div>
-                                <div class="h5 mb-0">Send extracted data to n8n</div>
-                                <div class="text-muted">Posts the latest analysis result (metrics/ratios shown in other tabs) to your n8n webhook.</div>
-                                <div class="text-muted small mt-1">Webhook: <span class="mono">{{ (n8n or {}).get('webhook_url') }}</span></div>
+                                <div class="h5 mb-0">Share extracted data with your workflow</div>
+                                <div class="text-muted">Sends the latest analysis result (metrics/ratios shown in other tabs) to your configured workflow endpoint.</div>
+                                <div class="text-muted small mt-1">Workflow endpoint: <span class="mono">{{ (n8n or {}).get('webhook_url') }}</span></div>
                             </div>
                             <div class="d-grid" style="min-width: 200px;">
-                                <button class="btn btn-primary" id="afN8nSendBtn" type="button"><i class="fa-solid fa-paper-plane me-2"></i>Send to n8n</button>
+                                <button class="btn btn-primary" id="afN8nSendBtn" type="button"><i class="fa-solid fa-paper-plane me-2"></i>Send report</button>
                             </div>
                         </div>
-                        <div class="form-text mt-2">Tip: Configure a different webhook via env <span class="mono">N8N_FINANCIAL_STATEMENT_UPLOAD_WEBHOOK</span>.</div>
+                        <div class="form-text mt-2">Tip: You can configure a different workflow endpoint from your environment settings.</div>
                     </div>
 
                     <div class="card p-3 mb-3">
@@ -2728,7 +2728,7 @@ TEMPLATE = """
 
                         <details class="mt-3">
                             <summary class="text-muted">Raw response</summary>
-                            <pre class="mono af-pre mt-2" id="afN8nResponse" style="min-height: 180px;">(click “Send to n8n” to post the latest extracted result)</pre>
+                            <pre class="mono af-pre mt-2" id="afN8nResponse" style="min-height: 180px;">(click “Send report” to deliver the latest extracted result)</pre>
                         </details>
                     </div>
                 </div>
@@ -3268,7 +3268,7 @@ TEMPLATE = """
             }
         });
     } catch (e) {
-        try { console.error('[n8n tab] init failed', e); } catch (_) {}
+        try { console.error('[workflow delivery tab] init failed', e); } catch (_) {}
     }
 })();
 </script>
@@ -3375,7 +3375,7 @@ def api_last():
 
 @app.route("/api/n8n/push", methods=["POST"])
 def api_n8n_push():
-    """Forward the latest UI analysis result to the configured n8n webhook."""
+    """Forward the latest UI analysis result to the configured workflow endpoint."""
 
     if _LAST_RESULT is None:
         return jsonify({"error": "no result yet (run an analysis first)"}), 404
@@ -3451,7 +3451,7 @@ def api_n8n_push():
         or _find_value_in_run(winner_run, "assets")
     )
 
-    # Provide a per-PDF breakdown as well (useful for n8n loops).
+    # Provide a per-PDF breakdown as well (useful for workflow loops).
     pdf_rows: List[Dict[str, Any]] = []
     try:
         for r in (last.get("results") or []):
@@ -3478,7 +3478,7 @@ def api_n8n_push():
                     "enbd": e_fields,
                     "generic": g_fields,
 
-                    # Also provide flattened extractor-specific fields for easy n8n sheet mapping
+                    # Also provide flattened extractor-specific fields for easy workflow sheet mapping
                     "hdfc_income_total_operating_income": h_fields.get("income_total_operating_income"),
                     "hdfc_income_profit_for_period": h_fields.get("income_profit_for_period"),
                     "hdfc_bs_total_assets": h_fields.get("bs_total_assets"),
@@ -3547,7 +3547,7 @@ def api_n8n_push():
         "sent_at": datetime.now(timezone.utc).isoformat(),
         "source": "agentic_flow_ui",
 
-        # Flat keys (match your existing n8n sheet fields)
+        # Flat keys (match your existing workflow sheet fields)
         "company_name": recommended_org or "",
         "quarter": "",
         "industry": "",
