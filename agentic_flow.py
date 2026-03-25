@@ -56,7 +56,7 @@ def _workspace_file(*parts: str) -> str:
 
 HDFC_EXTRACTOR_PATH = _workspace_file("hdfc_extraction_1.0.py")
 ENBD_EXTRACTOR_PATH = _workspace_file("enbd_extraction_1.0.py")
-GENERIC_EXTRACTOR_PATH = _workspace_file("generic_extraction.py")
+GENERIC_EXTRACTOR_PATH = (os.getenv("GENERIC_EXTRACTOR_PATH") or "").strip()
 
 
 DEFAULT_N8N_FINANCIAL_UPLOAD_WEBHOOK = "https://subhajit86.app.n8n.cloud/webhook/financial-statement-upload"
@@ -164,7 +164,7 @@ def _get_extractors():
         _HDFC_MOD = _load_module_from_path("hdfc_extractor_v1", HDFC_EXTRACTOR_PATH)
     if _ENBD_MOD is None:
         _ENBD_MOD = _load_module_from_path("enbd_extractor_v1", ENBD_EXTRACTOR_PATH)
-    if _GENERIC_MOD is None:
+    if GENERIC_EXTRACTOR_PATH and os.path.exists(GENERIC_EXTRACTOR_PATH) and _GENERIC_MOD is None:
         _GENERIC_MOD = _load_module_from_path("generic_extractor_v1", GENERIC_EXTRACTOR_PATH)
 
     return _HDFC_MOD, _ENBD_MOD, _GENERIC_MOD
@@ -1182,7 +1182,7 @@ def _llm_choose_best(
     runs: Dict[str, ExtractorRun],
     scores: Dict[str, ExtractorScore],
 ) -> Dict[str, Any]:
-    """Optional LLM judge; returns {"winner": "HDFC"|"ENBD"|"GENERIC"|None, ...}."""
+    """Optional LLM judge; returns {"winner": <extractor name>|None, ...}."""
 
     payload = {
         "bank_hint": pdf_hint,
@@ -1202,11 +1202,12 @@ def _llm_choose_best(
         },
     }
 
+    winner_options = "|".join(list(runs.keys()) + ["null"])
     prompt = (
         "You are judging which extraction pipeline performed better on a bank PDF. "
         "Pick the best pipeline using the provided metrics only. "
         "Prefer: higher fill_rate, more valid ratios, correct currency/units, and fewer errors. "
-        "Return strict JSON with keys: winner (HDFC|ENBD|GENERIC|null), confidence (0-1), reasons (array of 2-4 short strings).\n\n"
+        f"Return strict JSON with keys: winner ({winner_options}), confidence (0-1), reasons (array of 2-4 short strings).\n\n"
         f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -1251,8 +1252,9 @@ def analyze_pdf(pdf_path: str, use_llm_judge: bool = False) -> Dict[str, Any]:
     runs: Dict[str, ExtractorRun] = {
         "HDFC": _safe_call_extractor("HDFC", hdfc_mod, pdf_path),
         "ENBD": _safe_call_extractor("ENBD", enbd_mod, pdf_path),
-        "GENERIC": _safe_call_extractor("GENERIC", generic_mod, pdf_path),
     }
+    if generic_mod is not None:
+        runs["GENERIC"] = _safe_call_extractor("GENERIC", generic_mod, pdf_path)
 
     scores: Dict[str, ExtractorScore] = {
         k: _score_run(v, bank_hint) if v.ok else ExtractorScore(
@@ -1281,7 +1283,7 @@ def analyze_pdf(pdf_path: str, use_llm_judge: bool = False) -> Dict[str, Any]:
         client = _init_openai_client()
         if client is not None and ok_names:
             llm_judgement = _llm_choose_best(client, bank_hint, runs, scores)
-            if llm_judgement.get("winner") in ("HDFC", "ENBD", "GENERIC"):
+            if llm_judgement.get("winner") in runs:
                 winner = llm_judgement["winner"]
 
     return {
