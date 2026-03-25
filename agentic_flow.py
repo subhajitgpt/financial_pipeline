@@ -56,6 +56,7 @@ def _workspace_file(*parts: str) -> str:
 
 HDFC_EXTRACTOR_PATH = _workspace_file("hdfc_extraction_1.0.py")
 ENBD_EXTRACTOR_PATH = _workspace_file("enbd_extraction_1.0.py")
+GENERIC_EXTRACTOR_PATH = _workspace_file("generic_extraction.py")
 
 
 DEFAULT_N8N_FINANCIAL_UPLOAD_WEBHOOK = "https://subhajit86.app.n8n.cloud/webhook/financial-statement-upload"
@@ -63,6 +64,7 @@ N8N_FINANCIAL_UPLOAD_WEBHOOK_ENV = "N8N_FINANCIAL_STATEMENT_UPLOAD_WEBHOOK"
 
 _HDFC_MOD = None
 _ENBD_MOD = None
+_GENERIC_MOD = None
 
 
 def _to_float(x: Any) -> Optional[float]:
@@ -156,14 +158,16 @@ def to_usd(value: Any, units: Optional[Dict[str, Any]] = None) -> Optional[float
 
 
 def _get_extractors():
-    global _HDFC_MOD, _ENBD_MOD
+    global _HDFC_MOD, _ENBD_MOD, _GENERIC_MOD
 
     if _HDFC_MOD is None:
         _HDFC_MOD = _load_module_from_path("hdfc_extractor_v1", HDFC_EXTRACTOR_PATH)
     if _ENBD_MOD is None:
         _ENBD_MOD = _load_module_from_path("enbd_extractor_v1", ENBD_EXTRACTOR_PATH)
+    if _GENERIC_MOD is None:
+        _GENERIC_MOD = _load_module_from_path("generic_extractor_v1", GENERIC_EXTRACTOR_PATH)
 
-    return _HDFC_MOD, _ENBD_MOD
+    return _HDFC_MOD, _ENBD_MOD, _GENERIC_MOD
 
 
 def _n8n_webhook_url() -> str:
@@ -303,10 +307,78 @@ def _winner_run_from_entry(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str
         return None
     winner = entry.get("winner")
     runs = entry.get("runs") or {}
-    if isinstance(runs, dict) and winner in ("HDFC", "ENBD"):
+    if isinstance(runs, dict) and winner in ("HDFC", "ENBD", "GENERIC"):
         rr = runs.get(winner)
         return rr if isinstance(rr, dict) else None
     return None
+
+
+def _detect_organisation_hint(text: str) -> Optional[str]:
+    """Best-effort organisation name detection from early PDF text.
+
+    This is intentionally heuristic; it aims to give a stable label for grouping PDFs
+    even when the bank hint is unknown.
+    """
+
+    if not text:
+        return None
+
+    raw_lines = [re.sub(r"\s+", " ", ln.strip()) for ln in (text or "").splitlines()]
+    lines = [ln for ln in raw_lines if ln and len(ln) >= 4]
+
+    stop = {
+        "annual report",
+        "financial statements",
+        "consolidated financial statements",
+        "standalone financial statements",
+        "statement of financial position",
+        "statement of profit or loss",
+        "statement of comprehensive income",
+        "notes to the financial statements",
+    }
+
+    def looks_like_name(ln: str) -> bool:
+        l = ln.lower()
+        if any(s in l for s in stop):
+            return False
+        if re.search(r"\b(bank|limited|ltd\.|plc|pjsc|inc\.|corporation|group|holdings|company)\b", l):
+            return True
+        # all-caps short-ish lines often contain the org
+        if ln.isupper() and 4 <= len(ln) <= 70 and re.search(r"[A-Z]", ln):
+            return True
+        return False
+
+    # Prefer early lines that look like names
+    candidates: List[str] = []
+    for ln in lines[:60]:
+        if looks_like_name(ln):
+            candidates.append(ln)
+
+    if not candidates:
+        return None
+
+    def score(ln: str) -> float:
+        l = ln.lower()
+        s = 0.0
+        if re.search(r"\b(bank|group)\b", l):
+            s += 2.0
+        if re.search(r"\b(limited|plc|pjsc|inc\.|corporation|holdings|company)\b", l):
+            s += 1.5
+        if 8 <= len(ln) <= 55:
+            s += 1.0
+        if ln.isupper():
+            s += 0.6
+        # Penalize lines that are obviously headings
+        if re.search(r"\b(the|and|of|for)\b", l):
+            s -= 0.2
+        return s
+
+    best = max(candidates, key=score)
+    best = re.sub(r"\s{2,}", " ", best).strip(" -:")
+    # Avoid returning something overly generic.
+    if len(best) < 4:
+        return None
+    return best
 
 
 def _extract_key_fields_from_run(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -862,7 +934,7 @@ def _build_analysis_context(result: Dict[str, Any], max_chars: int = 14000) -> s
                 lines.append(
                     f"- {org}: avg_perf={float(d.get('avg_perf_score') or 0.0):.3f} "
                     f"avg_extraction={float(d.get('avg_extraction_score') or 0.0):.3f} "
-                    f"pdfs={int(d.get('pdf_count') or 0)} wins(HDFC/ENBD)={((d.get('wins') or {}).get('HDFC', 0))}/{((d.get('wins') or {}).get('ENBD', 0))}"
+                    f"pdfs={int(d.get('pdf_count') or 0)} wins(HDFC/ENBD/GENERIC)={((d.get('wins') or {}).get('HDFC', 0))}/{((d.get('wins') or {}).get('ENBD', 0))}/{((d.get('wins') or {}).get('GENERIC', 0))}"
                 )
             except Exception:
                 lines.append(f"- {org}: (summary unavailable)")
@@ -936,12 +1008,12 @@ def _build_metrics_tab_context(result: Dict[str, Any], max_chars: int = 14000) -
 
 
 def _build_extractor_tab_context(result: Dict[str, Any], extractor_name: str, max_chars: int = 14000) -> str:
-    """Build context aligned to the ENBD/HDFC extractor tabs."""
+    """Build context aligned to an extractor detail tab."""
     if not result:
         return ""
 
     extractor_name = (extractor_name or "").strip().upper()
-    if extractor_name not in ("ENBD", "HDFC"):
+    if extractor_name not in ("ENBD", "HDFC", "GENERIC"):
         return ""
 
     def fmt_pct(v: Any) -> str:
@@ -1110,7 +1182,7 @@ def _llm_choose_best(
     runs: Dict[str, ExtractorRun],
     scores: Dict[str, ExtractorScore],
 ) -> Dict[str, Any]:
-    """Optional LLM judge; returns {"winner": "HDFC"|"ENBD"|None, "reason": str}."""
+    """Optional LLM judge; returns {"winner": "HDFC"|"ENBD"|"GENERIC"|None, ...}."""
 
     payload = {
         "bank_hint": pdf_hint,
@@ -1134,7 +1206,7 @@ def _llm_choose_best(
         "You are judging which extraction pipeline performed better on a bank PDF. "
         "Pick the best pipeline using the provided metrics only. "
         "Prefer: higher fill_rate, more valid ratios, correct currency/units, and fewer errors. "
-        "Return strict JSON with keys: winner (HDFC|ENBD|null), confidence (0-1), reasons (array of 2-4 short strings).\n\n"
+        "Return strict JSON with keys: winner (HDFC|ENBD|GENERIC|null), confidence (0-1), reasons (array of 2-4 short strings).\n\n"
         f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
@@ -1170,14 +1242,16 @@ def _llm_choose_best(
 
 
 def analyze_pdf(pdf_path: str, use_llm_judge: bool = False) -> Dict[str, Any]:
-    hdfc_mod, enbd_mod = _get_extractors()
+    hdfc_mod, enbd_mod, generic_mod = _get_extractors()
 
     preview = _extract_native_text(pdf_path)
     bank_hint = _detect_bank_hint(preview)
+    org_hint = _detect_organisation_hint(preview)
 
     runs: Dict[str, ExtractorRun] = {
         "HDFC": _safe_call_extractor("HDFC", hdfc_mod, pdf_path),
         "ENBD": _safe_call_extractor("ENBD", enbd_mod, pdf_path),
+        "GENERIC": _safe_call_extractor("GENERIC", generic_mod, pdf_path),
     }
 
     scores: Dict[str, ExtractorScore] = {
@@ -1207,14 +1281,14 @@ def analyze_pdf(pdf_path: str, use_llm_judge: bool = False) -> Dict[str, Any]:
         client = _init_openai_client()
         if client is not None and ok_names:
             llm_judgement = _llm_choose_best(client, bank_hint, runs, scores)
-            if llm_judgement.get("winner") in ("HDFC", "ENBD"):
+            if llm_judgement.get("winner") in ("HDFC", "ENBD", "GENERIC"):
                 winner = llm_judgement["winner"]
 
     return {
         "pdf_path": pdf_path,
         "bank_hint": bank_hint,
         "winner": winner,
-        "organisation": bank_hint.get("likely") or winner,
+        "organisation": org_hint or bank_hint.get("likely") or winner or "Unknown",
         "runs": {k: asdict(v) for k, v in runs.items()},
         "scores": {k: asdict(v) for k, v in scores.items()},
         "llm_judgement": llm_judgement,
@@ -1230,7 +1304,7 @@ def analyze_pdfs(pdf_paths: List[str], use_llm_judge: bool = False) -> Dict[str,
         winner = r.get("winner")
         winner_ratios = None
         try:
-            if winner in ("HDFC", "ENBD"):
+            if winner in ("HDFC", "ENBD", "GENERIC"):
                 winner_ratios = (r.get("runs") or {}).get(winner, {}).get("ratios")
         except Exception:
             winner_ratios = None
@@ -1252,7 +1326,7 @@ def analyze_pdfs(pdf_paths: List[str], use_llm_judge: bool = False) -> Dict[str,
                 "pdf_count": 0,
                 "avg_perf_score": 0.0,
                 "avg_extraction_score": 0.0,
-                "wins": {"HDFC": 0, "ENBD": 0, "None": 0},
+                "wins": {"HDFC": 0, "ENBD": 0, "GENERIC": 0, "None": 0},
                 "perf_scores": [],
                 "extract_scores": [],
                 "coverage": [],
@@ -1281,13 +1355,13 @@ def analyze_pdfs(pdf_paths: List[str], use_llm_judge: bool = False) -> Dict[str,
             pass
 
         winner = r.get("winner") or "None"
-        if winner not in ("HDFC", "ENBD"):
+        if winner not in ("HDFC", "ENBD", "GENERIC"):
             winner = "None"
         orgs[org]["wins"][winner] += 1
 
         # Extraction score of the chosen winner (heuristic)
         try:
-            if winner in ("HDFC", "ENBD"):
+            if winner in ("HDFC", "ENBD", "GENERIC"):
                 sc = ((r.get("scores") or {}).get(winner) or {}).get("total")
                 if sc is not None:
                     orgs[org]["extract_scores"].append(float(sc))
@@ -1379,6 +1453,7 @@ def analyze_pdfs(pdf_paths: List[str], use_llm_judge: bool = False) -> Dict[str,
     result["llm_context_metrics"] = _build_metrics_tab_context(result)
     result["llm_context_enbd"] = _build_extractor_tab_context(result, "ENBD")
     result["llm_context_hdfc"] = _build_extractor_tab_context(result, "HDFC")
+    result["llm_context_generic"] = _build_extractor_tab_context(result, "GENERIC")
     return result
 
 
@@ -1432,7 +1507,7 @@ def jinja_pct(value: Any) -> str:
 def _template_context(**extra: Any) -> Dict[str, Any]:
     ctx = {
         "openai": _openai_status(),
-        "sources": {"HDFC": HDFC_EXTRACTOR_PATH, "ENBD": ENBD_EXTRACTOR_PATH},
+        "sources": {"HDFC": HDFC_EXTRACTOR_PATH, "ENBD": ENBD_EXTRACTOR_PATH, "GENERIC": GENERIC_EXTRACTOR_PATH},
         "fx": _fx_rates(),
         "n8n": {"webhook_url": _n8n_webhook_url()},
     }
@@ -1485,45 +1560,44 @@ TEMPLATE = """
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
         :root {
-            --primary-color: #10a37f;
-            --secondary-color: #0066cc;
-            --bg-light: #f7f7f8;
-            --card-border: rgba(15, 23, 42, 0.10);
-            --soft: rgba(15, 23, 42, 0.06);
-            --shadow: 0 8px 28px rgba(15, 23, 42, 0.06);
-            --shadow-lg: 0 18px 60px rgba(15, 23, 42, 0.10);
-            --text: #0f172a;
-            --muted: #64748b;
-            --radius: 16px;
+            /* Use Bootstrap design tokens for a consistent, professional look */
+            --af-radius: 14px;
+            --af-border: var(--bs-border-color-translucent);
+            --af-soft: rgba(var(--bs-body-color-rgb), 0.07);
+            --af-soft-2: rgba(var(--bs-body-color-rgb), 0.10);
+            --af-shadow: 0 10px 30px rgba(0, 0, 0, 0.06);
+            --af-shadow-lg: 0 18px 56px rgba(0, 0, 0, 0.10);
         }
         body {
-            background:
-                radial-gradient(1200px 520px at 12% -4%, rgba(0, 102, 204, 0.12) 0%, rgba(0, 102, 204, 0) 55%),
-                radial-gradient(900px 480px at 88% 0%, rgba(16, 163, 127, 0.12) 0%, rgba(16, 163, 127, 0) 55%),
-                var(--bg-light);
+            background: linear-gradient(
+                180deg,
+                rgba(var(--bs-primary-rgb), 0.06) 0%,
+                rgba(var(--bs-primary-rgb), 0.00) 42%
+            ), var(--bs-body-bg);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            color: var(--text);
+            color: var(--bs-body-color);
+            line-height: 1.45;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
         a { text-decoration: none; }
         .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-        .card { border: 1px solid var(--card-border); box-shadow: var(--shadow); border-radius: var(--radius); }
+        .af-break { overflow-wrap: anywhere; word-break: break-word; }
+        .container-xxl { max-width: 1220px; }
+        .card { border: 1px solid var(--af-border); box-shadow: var(--af-shadow); border-radius: var(--af-radius); }
         .card .card-title { letter-spacing: -0.01em; }
         .btn { border-radius: 12px; }
-        .btn-primary {
-            border: none;
-            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
-            box-shadow: 0 10px 26px rgba(0,0,0,0.10);
-        }
+        .btn-primary { box-shadow: 0 10px 26px rgba(0,0,0,0.10); }
         .btn-primary:hover { filter: brightness(0.98); }
         .btn-outline-secondary, .btn-outline-primary { border-radius: 12px; }
-        .form-control, .form-select { border-radius: 12px; border-color: rgba(15,23,42,0.12); }
-        .form-control:focus, .form-select:focus { border-color: rgba(16,163,127,0.5); box-shadow: 0 0 0 0.25rem rgba(16,163,127,0.10); }
+        .form-control, .form-select { border-radius: 12px; border-color: var(--af-soft-2); }
+        .form-control:focus, .form-select:focus { border-color: rgba(var(--bs-primary-rgb), 0.45); box-shadow: 0 0 0 0.25rem rgba(var(--bs-primary-rgb), 0.12); }
+        input[type="file"].form-control { padding: 0.6rem 0.75rem; }
         .af-header {
-            border: 1px solid var(--card-border);
-            background:
-                linear-gradient(135deg, rgba(255,255,255,0.92), rgba(248,250,252,0.86));
-            box-shadow: var(--shadow-lg);
-            border-radius: calc(var(--radius) + 2px);
+            border: 1px solid var(--af-border);
+            background: rgba(255,255,255,0.92);
+            box-shadow: var(--af-shadow-lg);
+            border-radius: calc(var(--af-radius) + 2px);
             position: relative;
             overflow: hidden;
         }
@@ -1532,8 +1606,8 @@ TEMPLATE = """
             position: absolute;
             inset: 0;
             background:
-                radial-gradient(700px 220px at 18% 18%, rgba(0,102,204,0.14) 0%, rgba(0,102,204,0) 60%),
-                radial-gradient(700px 220px at 82% 0%, rgba(16,163,127,0.18) 0%, rgba(16,163,127,0) 60%);
+                radial-gradient(700px 220px at 18% 18%, rgba(var(--bs-primary-rgb), 0.12) 0%, rgba(var(--bs-primary-rgb), 0) 60%),
+                radial-gradient(700px 220px at 82% 0%, rgba(var(--bs-secondary-rgb), 0.10) 0%, rgba(var(--bs-secondary-rgb), 0) 60%);
             pointer-events: none;
         }
         .af-header > * { position: relative; }
@@ -1550,15 +1624,15 @@ TEMPLATE = """
             align-items: center;
             justify-content: center;
             color: #fff;
-            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            background: rgba(var(--bs-primary-rgb), 1);
             box-shadow: 0 8px 18px rgba(0,0,0,0.12);
         }
-        .af-subtitle { color: var(--muted); max-width: 980px; }
-        .af-kpi { background: rgba(255,255,255,0.78); border: 1px solid var(--soft); border-radius: 14px; }
+        .af-subtitle { color: var(--bs-secondary-color); max-width: 980px; }
+        .af-kpi { background: rgba(255,255,255,0.78); border: 1px solid var(--af-soft); border-radius: 14px; }
         .af-tabs {
             border-bottom: 0;
             background: rgba(255,255,255,0.62);
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             border-radius: 14px;
             padding: 6px;
             gap: 6px;
@@ -1570,7 +1644,7 @@ TEMPLATE = """
         .af-tabs .nav-link {
             border: 0;
             border-radius: 12px;
-            color: #334155;
+            color: rgba(var(--bs-body-color-rgb), 0.82);
             padding: 10px 12px;
             width: 100%;
             display: inline-flex;
@@ -1582,11 +1656,11 @@ TEMPLATE = """
         .af-tabs .nav-link:hover { background: rgba(15,23,42,0.04); }
         .af-tabs .nav-link.active {
             font-weight: 700;
-            color: #0b1220;
-            background: rgba(16,163,127,0.10);
+            color: var(--bs-body-color);
+            background: rgba(var(--bs-primary-rgb), 0.10);
             box-shadow: 0 10px 28px rgba(15,23,42,0.08);
         }
-        details { border: 1px solid var(--soft); background: rgba(255,255,255,0.70); border-radius: 14px; padding: 10px 12px; }
+        details { border: 1px solid var(--af-soft); background: rgba(255,255,255,0.70); border-radius: 14px; padding: 10px 12px; }
         details[open] { box-shadow: 0 14px 38px rgba(15,23,42,0.10); }
         details > summary { cursor: pointer; list-style: none; }
         details > summary::-webkit-details-marker { display: none; }
@@ -1595,22 +1669,22 @@ TEMPLATE = """
             content: "\\f078";
             font-family: "Font Awesome 6 Free";
             font-weight: 900;
-            color: var(--muted);
+            color: var(--bs-secondary-color);
         }
         details[open] > summary:after { content: "\\f077"; }
         .table thead th { white-space: nowrap; }
         .table { --bs-table-bg: transparent; }
         .table thead { background: rgba(15, 23, 42, 0.03); }
         .table tbody tr:hover { background: rgba(2, 6, 23, 0.03); }
-        .af-pre { white-space: pre-wrap; background: rgba(255,255,255,0.80); border: 1px solid var(--soft); border-radius: 12px; padding: 12px; }
-        .af-muted { color: var(--muted); }
+        .af-pre { white-space: pre-wrap; background: rgba(255,255,255,0.80); border: 1px solid var(--af-soft); border-radius: 12px; padding: 12px; }
+        .af-muted { color: var(--bs-secondary-color); }
         .af-chip {
             display: inline-flex;
             align-items: center;
             gap: 8px;
             padding: 10px 12px;
             border-radius: 14px;
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.72);
         }
         .af-section-head {
@@ -1632,7 +1706,7 @@ TEMPLATE = """
 
         /* Summary + Metrics polish */
         .af-hero {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.78);
             border-radius: 18px;
             padding: 16px;
@@ -1647,26 +1721,26 @@ TEMPLATE = """
         @media (max-width: 992px) { .af-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         @media (max-width: 576px) { .af-kpi-grid { grid-template-columns: 1fr; } }
         .af-kpi {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.72);
             border-radius: 14px;
             padding: 12px;
         }
-        .af-kpi .label { color: var(--muted); font-size: 12px; }
+        .af-kpi .label { color: var(--bs-secondary-color); font-size: 12px; }
         .af-kpi .value { font-weight: 800; font-size: 18px; letter-spacing: -0.02em; margin-top: 4px; }
-        .af-kpi .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+        .af-kpi .sub { color: var(--bs-secondary-color); font-size: 12px; margin-top: 2px; }
         .af-list { list-style: none; padding-left: 0; margin: 0; }
         .af-list li {
             display: flex;
             gap: 10px;
             align-items: flex-start;
             padding: 8px 0;
-            border-bottom: 1px dashed var(--soft);
+            border-bottom: 1px dashed var(--af-soft);
         }
         .af-list li:last-child { border-bottom: 0; }
         .af-list i { color: rgba(15,23,42,0.45); margin-top: 3px; }
         .af-table-wrap {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.72);
             border-radius: 14px;
             overflow: hidden;
@@ -1676,7 +1750,7 @@ TEMPLATE = """
         .af-table-wrap .table thead th { font-weight: 750; font-size: 13px; color: rgba(15,23,42,0.80); }
         .af-table-wrap .table tbody td { vertical-align: middle; }
         .af-sw-box {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.70);
             border-radius: 14px;
             padding: 12px;
@@ -1692,7 +1766,7 @@ TEMPLATE = """
             font-weight: 800;
             letter-spacing: -0.02em;
         }
-        .af-block-subtitle { color: var(--muted); }
+        .af-block-subtitle { color: var(--bs-secondary-color); }
         .af-metrics-card { padding: 18px; }
         .af-metrics-head {
             display: flex;
@@ -1709,7 +1783,7 @@ TEMPLATE = """
             gap: 8px;
             padding: 6px 10px;
             border-radius: 999px;
-            border: 1px solid rgba(15,23,42,0.12);
+            border: 1px solid var(--af-soft-2);
             background: rgba(255,255,255,0.75);
             color: rgba(15,23,42,0.72);
             font-size: 12px;
@@ -1723,13 +1797,13 @@ TEMPLATE = """
         }
         .af-table-title i { color: rgba(15,23,42,0.65); }
         .af-table thead th {
-            background: rgba(15,23,42,0.92);
-            color: rgba(255,255,255,0.95);
+            background: var(--bs-tertiary-bg);
+            color: var(--bs-body-color);
             font-weight: 700;
-            border-bottom: 0;
+            border-bottom: 1px solid var(--af-soft);
         }
         .af-table tbody tr:nth-child(odd) { background: rgba(2,6,23,0.02); }
-        .af-value-usd { color: var(--muted); font-size: 12px; margin-top: 2px; }
+        .af-value-usd { color: var(--bs-secondary-color); font-size: 12px; margin-top: 2px; }
 
         .af-ratios-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
         @media (max-width: 992px) { .af-ratios-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -1742,12 +1816,12 @@ TEMPLATE = """
             box-shadow: 0 10px 26px rgba(15,23,42,0.06);
             min-height: 86px;
         }
-        .af-ratio-name { color: #2563eb; font-weight: 700; font-size: 13px; }
+        .af-ratio-name { color: rgba(var(--bs-primary-rgb), 1); font-weight: 700; font-size: 13px; }
         .af-ratio-val { font-weight: 800; font-size: 22px; letter-spacing: -0.02em; margin-top: 6px; }
 
         /* OpenAI chat panel */
         .af-chat-wrap {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.94);
             border-radius: 14px;
             overflow: hidden;
@@ -1759,7 +1833,7 @@ TEMPLATE = """
             gap: 12px;
             padding: 12px 14px;
             background: rgba(15, 23, 42, 0.06);
-            border-bottom: 1px solid var(--soft);
+            border-bottom: 1px solid var(--af-soft);
         }
         .af-chat-head .title {
             display: flex;
@@ -1787,13 +1861,13 @@ TEMPLATE = """
         .af-msg.user { justify-content: flex-end; }
         .af-msg.user .af-bubble {
             border: none;
-            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            background: rgba(var(--bs-primary-rgb), 1);
             color: rgba(255,255,255,0.96);
         }
         .af-msg.assistant { justify-content: flex-start; }
         .af-chat-foot {
             padding: 12px 14px;
-            border-top: 1px solid var(--soft);
+            border-top: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.92);
         }
         .af-typing-caret {
@@ -1826,8 +1900,8 @@ TEMPLATE = """
             border-radius: 999px;
             padding: 12px 14px;
             color: rgba(255,255,255,0.96);
-            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
-            box-shadow: 0 18px 60px rgba(15,23,42,0.18);
+            background: rgba(var(--bs-primary-rgb), 1);
+            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.18);
             display: inline-flex;
             align-items: center;
             gap: 10px;
@@ -1851,7 +1925,7 @@ TEMPLATE = """
             height: min(640px, calc(100dvh - 110px));
             display: none;
             flex-direction: column;
-            box-shadow: var(--shadow-lg);
+            box-shadow: var(--af-shadow-lg);
             transform: translateY(10px);
             opacity: 0;
             transition: transform 160ms ease, opacity 160ms ease;
@@ -1897,21 +1971,21 @@ TEMPLATE = """
             gap: 8px;
             padding: 10px 14px;
             background: rgba(255,255,255,0.65);
-            border-bottom: 1px solid var(--soft);
+            border-bottom: 1px solid var(--af-soft);
         }
         .af-chat-tab-btn {
-            border: 1px solid var(--soft);
+            border: 1px solid var(--af-soft);
             background: rgba(255,255,255,0.72);
-            color: #334155;
+            color: rgba(var(--bs-body-color-rgb), 0.82);
             border-radius: 999px;
             padding: 6px 10px;
             font-weight: 800;
             font-size: 12px;
         }
         .af-chat-tab-btn.active {
-            background: rgba(16,163,127,0.10);
+            background: rgba(var(--bs-primary-rgb), 0.10);
             box-shadow: 0 10px 28px rgba(15,23,42,0.08);
-            color: #0b1220;
+            color: var(--bs-body-color);
         }
         .af-chat-tab-pane {
             display: none;
@@ -1939,9 +2013,9 @@ TEMPLATE = """
                     <div>
                         <div class="d-flex align-items-center flex-wrap gap-2">
                             <h3 class="mb-0">Financial Statement Analyzer and Recommendation Agent</h3>
-                            <span class="badge text-bg-primary">Extractor Comparator</span>
+                            <span class="badge text-bg-primary">Multi-Extractor</span>
                         </div>
-                        <div class="af-subtitle mt-1">Upload PDFs, run both extractors, score extraction quality, and recommend the best-performing organisation using standardized ratios.</div>
+                        <div class="af-subtitle mt-1">Upload PDFs, run specialized + generic extractors, score extraction quality, and recommend the best-performing organisation using standardized ratios.</div>
                     </div>
                 </div>
             </div>
@@ -2151,7 +2225,7 @@ TEMPLATE = """
                             <details class="mb-2">
                                 <summary>
                                     <div class="d-flex flex-wrap gap-2 align-items-center">
-                                        <span class="mono">{{ r.pdf_path }}</span>
+                                        <span class="mono af-break">{{ r.pdf_path }}</span>
                                         <span class="badge text-bg-light border">org: <span class="mono">{{ r.organisation }}</span></span>
                                         <span class="badge text-bg-light border">perf: <span class="mono">{{ "%.3f"|format(r.org_performance.score) }}</span></span>
                                     </div>
@@ -2358,7 +2432,7 @@ TEMPLATE = """
                                 <tbody>
                                     {% for r in result.results %}
                                         <tr>
-                                            <td class="mono">{{ r.pdf_path }}</td>
+                                            <td class="mono af-break">{{ r.pdf_path }}</td>
                                             <td class="mono">{{ r.organisation }}</td>
                                             {% for m in result.metric_schema %}
                                                 {% set v = (r.key_metrics or {}).get(m.key) %}
@@ -2389,12 +2463,11 @@ TEMPLATE = """
                         </div>
                     </div>
                     {% for r in result.results %}
-                        {% if r.organisation == 'ENBD' %}
                         {% set run = (r.runs or {}).get('ENBD') %}
                         <div class="card p-3 mb-3">
                             <div class="d-flex justify-content-between flex-wrap gap-2">
                                 <div>
-                                    <div class="h6 mb-0"><span class="mono">{{ r.pdf_path }}</span></div>
+                                    <div class="h6 mb-0"><span class="mono af-break">{{ r.pdf_path }}</span></div>
                                     <div class="text-muted small">org={{ r.organisation }}</div>
                                 </div>
                                 <div>
@@ -2495,7 +2568,6 @@ TEMPLATE = """
                                 <div class="alert alert-danger mb-0">{{ (run.error if run else 'Extractor failed') }}</div>
                             {% endif %}
                         </div>
-                        {% endif %}
                     {% endfor %}
                 </div>
 
@@ -2514,12 +2586,11 @@ TEMPLATE = """
                         </div>
                     </div>
                     {% for r in result.results %}
-                        {% if r.organisation == 'HDFC' %}
                         {% set run = (r.runs or {}).get('HDFC') %}
                         <div class="card p-3 mb-3">
                             <div class="d-flex justify-content-between flex-wrap gap-2">
                                 <div>
-                                    <div class="h6 mb-0"><span class="mono">{{ r.pdf_path }}</span></div>
+                                    <div class="h6 mb-0"><span class="mono af-break">{{ r.pdf_path }}</span></div>
                                     <div class="text-muted small">org={{ r.organisation }}</div>
                                 </div>
                                 <div>
@@ -2620,7 +2691,6 @@ TEMPLATE = """
                                 <div class="alert alert-danger mb-0">{{ (run.error if run else 'Extractor failed') }}</div>
                             {% endif %}
                         </div>
-                        {% endif %}
                     {% endfor %}
                 </div>
 
@@ -2714,7 +2784,7 @@ TEMPLATE = """
                         <textarea class="form-control" id="afChatInput" rows="2" placeholder="Ask about the current analysis…"></textarea>
                     </div>
                     <div class="col-3 d-grid">
-                        <button class="btn btn-primary" id="afChatSend" type="button" onclick="if(window.__FinanceBotMainBound){return;}(function(){try{var logEl=document.getElementById('afChatLog');var inputEl=document.getElementById('afChatInput');var activeBtn=document.querySelector('.af-tabs .nav-link.active');var target=(activeBtn&&activeBtn.getAttribute?activeBtn.getAttribute('data-bs-target'):null)||'#tab-summary';var map={'#tab-summary':'afLlmContextSummary','#tab-metrics':'afLlmContextMetrics','#tab-enbd':'afLlmContextENBD','#tab-hdfc':'afLlmContextHDFC'};var ctxEl=document.getElementById(map[target]||'afLlmContext')||document.getElementById('afLlmContext');var msg=(inputEl&&inputEl.value?inputEl.value:'').trim();if(!msg||!logEl||!inputEl)return;var ctx=(ctxEl&&ctxEl.value?ctxEl.value:'');var append=function(role,text){var row=document.createElement('div');row.className='af-msg '+role;var bubble=document.createElement('div');bubble.className='af-bubble';bubble.textContent=text||'';row.appendChild(bubble);logEl.appendChild(row);try{logEl.scrollTop=logEl.scrollHeight;}catch(e){}};append('user',msg);inputEl.value='';inputEl.disabled=true;var btn=document.getElementById('afChatSend');if(btn)btn.disabled=true;append('assistant','…');var lastBubble=logEl.lastChild&&logEl.lastChild.querySelector?logEl.lastChild.querySelector('.af-bubble'):null;fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,context:ctx,history:[]})}).then(function(r){return r.json().catch(function(){return {error:r.statusText||'bad response'};});}).then(function(data){var out=(data&&data.answer)?data.answer:('Error: '+((data&&data.error)?data.error:'Unknown error'));if(lastBubble)lastBubble.textContent=out;}).catch(function(e){if(lastBubble)lastBubble.textContent='Error: '+e;}).finally(function(){inputEl.disabled=false;try{inputEl.focus();}catch(e){}if(btn)btn.disabled=false;});}catch(e){try{console.error('afChatSend fallback error',e);}catch(_){} }})();"><i class="fa-solid fa-paper-plane me-2"></i>Send</button>
+                        <button class="btn btn-primary" id="afChatSend" type="button" onclick="if(window.__FinanceBotMainBound){return;}(function(){try{var logEl=document.getElementById('afChatLog');var inputEl=document.getElementById('afChatInput');var activeBtn=document.querySelector('.af-tabs .nav-link.active');var target=(activeBtn&&activeBtn.getAttribute?activeBtn.getAttribute('data-bs-target'):null)||'#tab-summary';var map={'#tab-summary':'afLlmContextSummary','#tab-metrics':'afLlmContextMetrics','#tab-enbd':'afLlmContextENBD','#tab-hdfc':'afLlmContextHDFC'};var ctxEl=document.getElementById(map[target]||'afLlmContext')||document.getElementById('afLlmContext');var msg=(inputEl&&inputEl.value?inputEl.value:'').trim();if(!msg||!logEl||!inputEl)return;var ctx=(ctxEl&&ctxEl.value?ctxEl.value:'');var append=function(role,text){var row=document.createElement('div');row.className='af-msg '+role;var bubble=document.createElement('div');bubble.className='af-bubble';bubble.textContent=text||'';row.appendChild(bubble);logEl.appendChild(row);try{logEl.scrollTop=logEl.scrollHeight;}catch(e){}};append('user',msg);inputEl.value='';inputEl.disabled=true;var btn=document.getElementById('afChatSend');if(btn)btn.disabled=true;append('assistant','…');var lastBubble=logEl.lastChild&&logEl.lastChild.querySelector?logEl.lastChild.querySelector('.af-bubble'):null;fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,context:ctx,history:[]})}).then(function(r){return r.json().catch(function(){return {error:r.statusText||'bad response'};});}).then(function(data){var out=(data&&data.answer)?data.answer:('Error: '+((data&&data.error)?data.error: 'Unknown error'));if(lastBubble)lastBubble.textContent=out;}).catch(function(e){if(lastBubble)lastBubble.textContent='Error: '+e;}).finally(function(){inputEl.disabled=false;try{inputEl.focus();}catch(e){}if(btn)btn.disabled=false;});}catch(e){try{console.error('afChatSend fallback error',e);}catch(_){} }})();"><i class="fa-solid fa-paper-plane me-2"></i>Send</button>
                     </div>
                 </div>
                 <div class="form-text">Tip: Press <span class="mono">Enter</span> to send · <span class="mono">Shift+Enter</span> for a new line.</div>
@@ -2741,7 +2811,7 @@ TEMPLATE = """
 
 <div class="container-xxl pb-4">
     <div class="text-center small text-muted">
-        Designed for quick extractor comparison. Always validate results against source statements.
+        Designed for quick, best-effort extraction across statement formats. Always validate results against source statements.
     </div>
 </div>
 
@@ -3330,6 +3400,7 @@ def api_n8n_push():
 
     hdfc_run = runs_for_entry.get("HDFC") if isinstance(runs_for_entry.get("HDFC"), dict) else None
     enbd_run = runs_for_entry.get("ENBD") if isinstance(runs_for_entry.get("ENBD"), dict) else None
+    generic_run = runs_for_entry.get("GENERIC") if isinstance(runs_for_entry.get("GENERIC"), dict) else None
 
     # Winner run is still used for legacy top-level flat fields.
     winner_run = _winner_run_from_entry(entry)
@@ -3337,6 +3408,7 @@ def api_n8n_push():
 
     hdfc_fields = _extract_key_fields_from_run(hdfc_run)
     enbd_fields = _extract_key_fields_from_run(enbd_run)
+    generic_fields = _extract_key_fields_from_run(generic_run)
 
     ratio_roa = None
     ratio_roe = None
@@ -3384,8 +3456,10 @@ def api_n8n_push():
             runs = (r.get("runs") or {}) if isinstance(r, dict) else {}
             h_run = runs.get("HDFC") if isinstance(runs, dict) and isinstance(runs.get("HDFC"), dict) else None
             e_run = runs.get("ENBD") if isinstance(runs, dict) and isinstance(runs.get("ENBD"), dict) else None
+            g_run = runs.get("GENERIC") if isinstance(runs, dict) and isinstance(runs.get("GENERIC"), dict) else None
             h_fields = _extract_key_fields_from_run(h_run)
             e_fields = _extract_key_fields_from_run(e_run)
+            g_fields = _extract_key_fields_from_run(g_run)
 
             rr = _winner_run_from_entry(r)
             rm = _ratio_map_from_run(rr)
@@ -3400,6 +3474,7 @@ def api_n8n_push():
                     # Extractor-specific payloads (both extractors, regardless of winner)
                     "hdfc": h_fields,
                     "enbd": e_fields,
+                    "generic": g_fields,
 
                     # Also provide flattened extractor-specific fields for easy n8n sheet mapping
                     "hdfc_income_total_operating_income": h_fields.get("income_total_operating_income"),
@@ -3421,6 +3496,16 @@ def api_n8n_push():
                     "enbd_ratio_npl_ratio": e_fields.get("ratio_npl_ratio"),
                     "enbd_ratio_coverage_ratio": e_fields.get("ratio_coverage_ratio"),
                     "enbd_ratio_loan_to_deposit": e_fields.get("ratio_loan_to_deposit"),
+
+                    "generic_income_total_operating_income": g_fields.get("income_total_operating_income"),
+                    "generic_income_profit_for_period": g_fields.get("income_profit_for_period"),
+                    "generic_bs_total_assets": g_fields.get("bs_total_assets"),
+                    "generic_ratio_roa": g_fields.get("ratio_roa"),
+                    "generic_ratio_roe": g_fields.get("ratio_roe"),
+                    "generic_ratio_cost_to_income": g_fields.get("ratio_cost_to_income"),
+                    "generic_ratio_npl_ratio": g_fields.get("ratio_npl_ratio"),
+                    "generic_ratio_coverage_ratio": g_fields.get("ratio_coverage_ratio"),
+                    "generic_ratio_loan_to_deposit": g_fields.get("ratio_loan_to_deposit"),
                     "income_total_operating_income": (
                         _find_value_in_run(rr, "total", "operating", "income")
                         or _find_value_in_run(rr, "operating", "income")
@@ -3497,6 +3582,16 @@ def api_n8n_push():
         "enbd_ratio_npl_ratio": enbd_fields.get("ratio_npl_ratio"),
         "enbd_ratio_coverage_ratio": enbd_fields.get("ratio_coverage_ratio"),
         "enbd_ratio_loan_to_deposit": enbd_fields.get("ratio_loan_to_deposit"),
+
+        "generic_income_total_operating_income": generic_fields.get("income_total_operating_income"),
+        "generic_income_profit_for_period": generic_fields.get("income_profit_for_period"),
+        "generic_bs_total_assets": generic_fields.get("bs_total_assets"),
+        "generic_ratio_roa": generic_fields.get("ratio_roa"),
+        "generic_ratio_roe": generic_fields.get("ratio_roe"),
+        "generic_ratio_cost_to_income": generic_fields.get("ratio_cost_to_income"),
+        "generic_ratio_npl_ratio": generic_fields.get("ratio_npl_ratio"),
+        "generic_ratio_coverage_ratio": generic_fields.get("ratio_coverage_ratio"),
+        "generic_ratio_loan_to_deposit": generic_fields.get("ratio_loan_to_deposit"),
 
         # Extra structured data for richer automations
         "recommended_organisation": recommended_org,
@@ -3717,11 +3812,11 @@ def _cli() -> int:
             for org, d in (result.get("organisations") or {}).items():
                 print(
                     f"- {org}: avg_perf={d.get('avg_perf_score', 0.0):.3f} avg_extraction={d.get('avg_extraction_score', 0.0):.3f} "
-                    f"pdfs={d.get('pdf_count', 0)} wins(HDFC/ENBD)={d.get('wins', {}).get('HDFC', 0)}/{d.get('wins', {}).get('ENBD', 0)}"
+                    f"pdfs={d.get('pdf_count', 0)} wins(HDFC/ENBD/GENERIC)={d.get('wins', {}).get('HDFC', 0)}/{d.get('wins', {}).get('ENBD', 0)}/{d.get('wins', {}).get('GENERIC', 0)}"
                 )
         else:
             print(f"winner={result.get('winner')}")
-            for name in ("HDFC", "ENBD"):
+            for name in ("HDFC", "ENBD", "GENERIC"):
                 run = result["runs"][name]
                 sc = result["scores"][name]
                 print(

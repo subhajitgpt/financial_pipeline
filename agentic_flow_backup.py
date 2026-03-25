@@ -7,7 +7,10 @@ import os
 import re
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
@@ -53,6 +56,10 @@ def _workspace_file(*parts: str) -> str:
 
 HDFC_EXTRACTOR_PATH = _workspace_file("hdfc_extraction_1.0.py")
 ENBD_EXTRACTOR_PATH = _workspace_file("enbd_extraction_1.0.py")
+
+
+DEFAULT_N8N_FINANCIAL_UPLOAD_WEBHOOK = "https://subhajit86.app.n8n.cloud/webhook/financial-statement-upload"
+N8N_FINANCIAL_UPLOAD_WEBHOOK_ENV = "N8N_FINANCIAL_STATEMENT_UPLOAD_WEBHOOK"
 
 _HDFC_MOD = None
 _ENBD_MOD = None
@@ -157,6 +164,210 @@ def _get_extractors():
         _ENBD_MOD = _load_module_from_path("enbd_extractor_v1", ENBD_EXTRACTOR_PATH)
 
     return _HDFC_MOD, _ENBD_MOD
+
+
+def _n8n_webhook_url() -> str:
+    load_dotenv()
+    url = (os.getenv(N8N_FINANCIAL_UPLOAD_WEBHOOK_ENV) or "").strip()
+    return url or DEFAULT_N8N_FINANCIAL_UPLOAD_WEBHOOK
+
+
+def _sanitize_result_for_export(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe, reasonably sized payload for external systems.
+
+    Keeps the extracted metrics/ratios (what the tabs show) and removes UI/LLM helper
+    context strings that are not needed for automation.
+    """
+
+    try:
+        safe: Dict[str, Any] = json.loads(json.dumps(result, ensure_ascii=False))
+    except Exception:
+        safe = dict(result or {})
+
+    for k in (
+        "llm_context",
+        "llm_context_summary",
+        "llm_context_metrics",
+        "llm_context_enbd",
+        "llm_context_hdfc",
+    ):
+        safe.pop(k, None)
+
+    # Remove per-extractor LLM-context previews which can be large.
+    try:
+        for r in (safe.get("results") or []):
+            runs = r.get("runs") or {}
+            if isinstance(runs, dict):
+                for run in runs.values():
+                    if isinstance(run, dict):
+                        run.pop("context", None)
+    except Exception:
+        pass
+
+    return safe
+
+
+def _http_post_json(url: str, payload: Dict[str, Any], timeout_s: float = 25.0) -> Dict[str, Any]:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "agentic-flow/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status), "body": body}
+    except urllib.error.HTTPError as e:
+        try:
+            body = (e.read() or b"").decode("utf-8", errors="replace")
+        except Exception:
+            body = str(e)
+        return {"ok": False, "status": int(getattr(e, "code", 500) or 500), "body": body}
+
+
+def _norm_key(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip().lower())
+
+
+def _find_value_in_run(run: Optional[Dict[str, Any]], *needles: str) -> Optional[float]:
+    """Heuristically find a numeric value within a run's extracted metrics.
+
+    Searches `single` metrics first, then `dual` (prefers current over prior).
+    `needles` are substrings that must all appear in the normalized metric key.
+    """
+
+    if not run or not isinstance(run, dict):
+        return None
+
+    needle_norm = [_norm_key(n) for n in needles if (n or "").strip()]
+    if not needle_norm:
+        return None
+
+    def key_matches(k: Any) -> bool:
+        nk = _norm_key(k)
+        return all(n in nk for n in needle_norm)
+
+    single = run.get("single") or {}
+    if isinstance(single, dict):
+        for k, v in single.items():
+            if not key_matches(k):
+                continue
+            fv = _to_float(v)
+            if fv is not None:
+                return fv
+
+    dual = run.get("dual") or {}
+    if isinstance(dual, dict):
+        for k, v in dual.items():
+            if not key_matches(k):
+                continue
+            if isinstance(v, dict):
+                fv = _to_float(v.get("current"))
+                if fv is not None:
+                    return fv
+                fv = _to_float(v.get("prior"))
+                if fv is not None:
+                    return fv
+
+    return None
+
+
+def _ratio_map_from_run(run: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    try:
+        ratios = (run or {}).get("ratios")
+        return _ratios_to_dict(ratios)
+    except Exception:
+        return {}
+
+
+def _best_pdf_entry_for_org(result: Dict[str, Any], org: Optional[str]) -> Optional[Dict[str, Any]]:
+    items = result.get("results") or []
+    if not isinstance(items, list) or not items:
+        return None
+    if org:
+        for r in items:
+            if str(r.get("organisation") or "").strip() == str(org).strip():
+                return r
+    return items[0]
+
+
+def _winner_run_from_entry(entry: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not entry or not isinstance(entry, dict):
+        return None
+    winner = entry.get("winner")
+    runs = entry.get("runs") or {}
+    if isinstance(runs, dict) and winner in ("HDFC", "ENBD"):
+        rr = runs.get(winner)
+        return rr if isinstance(rr, dict) else None
+    return None
+
+
+def _extract_key_fields_from_run(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract a compact set of financial line items + ratios from a run dict.
+
+    This is used for n8n export so we can send BOTH extractor outputs (HDFC + ENBD)
+    rather than only the winner.
+    """
+
+    if not run or not isinstance(run, dict):
+        return {
+            "units": None,
+            "income_total_operating_income": None,
+            "income_profit_for_period": None,
+            "bs_total_assets": None,
+            "ratio_roa": None,
+            "ratio_roe": None,
+            "ratio_cost_to_income": None,
+            "ratio_npl_ratio": None,
+            "ratio_coverage_ratio": None,
+            "ratio_loan_to_deposit": None,
+        }
+
+    ratio_map = _ratio_map_from_run(run)
+    return {
+        "units": run.get("units") if isinstance(run.get("units"), dict) else None,
+        "income_total_operating_income": (
+            _find_value_in_run(run, "total", "operating", "income")
+            or _find_value_in_run(run, "operating", "income")
+            or _find_value_in_run(run, "total", "income")
+            or _find_value_in_run(run, "operating", "revenue")
+        ),
+        "income_profit_for_period": (
+            _find_value_in_run(run, "profit", "period")
+            or _find_value_in_run(run, "profit", "year")
+            or _find_value_in_run(run, "net", "profit")
+            or _find_value_in_run(run, "profit", "after", "tax")
+            or _find_value_in_run(run, "net", "income")
+        ),
+        "bs_total_assets": (_find_value_in_run(run, "total", "assets") or _find_value_in_run(run, "assets")),
+        "ratio_roa": _find_ratio_value(ratio_map, "roa"),
+        "ratio_roe": _find_ratio_value(ratio_map, "roe"),
+        "ratio_cost_to_income": _find_ratio_value(ratio_map, "cost", "income"),
+        "ratio_npl_ratio": (
+            _find_ratio_value(ratio_map, "npl")
+            or _find_ratio_value(ratio_map, "npa")
+            or _find_ratio_value(ratio_map, "gross", "npa")
+            or _find_ratio_value(ratio_map, "net", "npa")
+        ),
+        "ratio_coverage_ratio": (
+            _find_ratio_value(ratio_map, "coverage", "ratio")
+            or _find_ratio_value(ratio_map, "provision", "coverage")
+            or _find_ratio_value(ratio_map, "coverage")
+        ),
+        "ratio_loan_to_deposit": (
+            _find_ratio_value(ratio_map, "loan", "deposit")
+            or _find_ratio_value(ratio_map, "loan-to-deposit")
+            or _find_ratio_value(ratio_map, "ldr")
+        ),
+    }
+
 
 
 @dataclass
@@ -1223,7 +1434,9 @@ def _template_context(**extra: Any) -> Dict[str, Any]:
         "openai": _openai_status(),
         "sources": {"HDFC": HDFC_EXTRACTOR_PATH, "ENBD": ENBD_EXTRACTOR_PATH},
         "fx": _fx_rates(),
+        "n8n": {"webhook_url": _n8n_webhook_url()},
     }
+
     ctx.update(extra)
     return ctx
 
@@ -1787,6 +2000,9 @@ TEMPLATE = """
                 </li>
                 <li class="nav-item" role="presentation">
                     <button class="nav-link" id="tab-hdfc-btn" data-bs-toggle="tab" data-bs-target="#tab-hdfc" type="button" role="tab">HDFC</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="tab-n8n-btn" data-bs-toggle="tab" data-bs-target="#tab-n8n" type="button" role="tab">n8n</button>
                 </li>
             </ul>
 
@@ -2408,6 +2624,43 @@ TEMPLATE = """
                     {% endfor %}
                 </div>
 
+                <div class="tab-pane fade" id="tab-n8n" role="tabpanel" aria-labelledby="tab-n8n-btn">
+                    <div class="card p-3 mb-3">
+                        <div class="d-flex justify-content-between flex-wrap gap-2">
+                            <div>
+                                <div class="h5 mb-0">Send extracted data to n8n</div>
+                                <div class="text-muted">Posts the latest analysis result (metrics/ratios shown in other tabs) to your n8n webhook.</div>
+                                <div class="text-muted small mt-1">Webhook: <span class="mono">{{ (n8n or {}).get('webhook_url') }}</span></div>
+                            </div>
+                            <div class="d-grid" style="min-width: 200px;">
+                                <button class="btn btn-primary" id="afN8nSendBtn" type="button"><i class="fa-solid fa-paper-plane me-2"></i>Send to n8n</button>
+                            </div>
+                        </div>
+                        <div class="form-text mt-2">Tip: Configure a different webhook via env <span class="mono">N8N_FINANCIAL_STATEMENT_UPLOAD_WEBHOOK</span>.</div>
+                    </div>
+
+                    <div class="card p-3 mb-3">
+                        <div class="text-muted mb-2">Response</div>
+                        <div class="mono small text-muted" id="afN8nStatus">Ready.</div>
+                        <div class="table-responsive mt-2">
+                            <table class="table table-sm table-striped align-middle mb-0" id="afN8nResponseTable">
+                                <thead>
+                                    <tr>
+                                        <th style="width: 35%;">Field</th>
+                                        <th>Value</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+
+                        <details class="mt-3">
+                            <summary class="text-muted">Raw response</summary>
+                            <pre class="mono af-pre mt-2" id="afN8nResponse" style="min-height: 180px;">(click “Send to n8n” to post the latest extracted result)</pre>
+                        </details>
+                    </div>
+                </div>
+
             </div>
         {% else %}
             <div class="alert alert-warning">No results.</div>
@@ -2516,6 +2769,7 @@ TEMPLATE = """
                 '#tab-metrics': 'afLlmContextMetrics',
                 '#tab-enbd': 'afLlmContextENBD',
                 '#tab-hdfc': 'afLlmContextHDFC',
+                '#tab-n8n': 'afLlmContextSummary',
             };
             const id = map[target] || 'afLlmContext';
             const el = document.getElementById(id) || document.getElementById('afLlmContext');
@@ -2845,6 +3099,108 @@ TEMPLATE = """
 })();
 </script>
 
+<script>
+(() => {
+    try {
+        const btn = document.getElementById('afN8nSendBtn');
+        const statusEl = document.getElementById('afN8nStatus');
+        const respEl = document.getElementById('afN8nResponse');
+        const tableEl = document.getElementById('afN8nResponseTable');
+        if (!btn || !statusEl || !respEl || !tableEl) return;
+
+        const tbodyEl = tableEl.querySelector('tbody');
+        if (!tbodyEl) return;
+
+        const setStatus = (text, cls) => {
+            statusEl.className = cls ? (`mono small ${cls}`) : 'mono small text-muted';
+            statusEl.textContent = text || '';
+        };
+
+        const flattenObject = (obj, prefix = '', out = {}, depth = 0) => {
+            if (obj === null || obj === undefined) return out;
+            if (depth > 4) {
+                out[prefix || '(root)'] = JSON.stringify(obj);
+                return out;
+            }
+            if (Array.isArray(obj)) {
+                // Keep arrays compact in table; raw view shows full JSON.
+                out[prefix || '(root)'] = JSON.stringify(obj);
+                return out;
+            }
+            if (typeof obj !== 'object') {
+                out[prefix || '(root)'] = obj;
+                return out;
+            }
+            const keys = Object.keys(obj);
+            if (!keys.length) {
+                out[prefix || '(root)'] = '{}';
+                return out;
+            }
+            for (const k of keys) {
+                const v = obj[k];
+                const next = prefix ? `${prefix}.${k}` : k;
+                if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+                    flattenObject(v, next, out, depth + 1);
+                } else {
+                    out[next] = v;
+                }
+            }
+            return out;
+        };
+
+        const renderTable = (obj) => {
+            tbodyEl.innerHTML = '';
+            const flat = flattenObject(obj || {});
+            const keys = Object.keys(flat).sort();
+            if (!keys.length) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td class="text-muted">(no fields)</td><td class="text-muted">—</td>`;
+                tbodyEl.appendChild(tr);
+                return;
+            }
+            for (const k of keys) {
+                const v = flat[k];
+                const vv = (v === null || v === undefined)
+                    ? ''
+                    : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td class="mono">${k}</td><td class="mono">${vv.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</td>`;
+                tbodyEl.appendChild(tr);
+            }
+        };
+
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            setStatus('Sending…', 'text-muted');
+            respEl.textContent = '';
+            renderTable({});
+            try {
+                const r = await fetch('/api/n8n/push', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                const data = await r.json().catch(() => ({}));
+                if (!r.ok) {
+                    throw new Error((data && data.error) ? data.error : (r.statusText || `HTTP ${r.status}`));
+                }
+                setStatus(`OK (status ${data.status})`, 'text-success');
+                renderTable(data.response_json || data);
+                respEl.textContent = JSON.stringify(data, null, 2);
+            } catch (e) {
+                setStatus('Failed', 'text-danger');
+                renderTable({ error: String(e) });
+                respEl.textContent = `Error: ${e}`;
+            } finally {
+                btn.disabled = false;
+            }
+        });
+    } catch (e) {
+        try { console.error('[n8n tab] init failed', e); } catch (_) {}
+    }
+})();
+</script>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
@@ -2943,6 +3299,232 @@ def api_last():
     if _LAST_RESULT is None:
         return jsonify({"error": "no result yet"}), 404
     return jsonify(_LAST_RESULT)
+
+
+@app.route("/api/n8n/push", methods=["POST"])
+def api_n8n_push():
+    """Forward the latest UI analysis result to the configured n8n webhook."""
+
+    if _LAST_RESULT is None:
+        return jsonify({"error": "no result yet (run an analysis first)"}), 404
+
+    url = _n8n_webhook_url()
+
+    last = _LAST_RESULT or {}
+    recommended_org = last.get("recommended_organisation")
+    orgs = last.get("organisations") or {}
+
+    # Prefer ratios from org-level averages (Key Metrics tab), fallback to winner-run ratios.
+    org_metrics = None
+    try:
+        if recommended_org and isinstance(orgs, dict):
+            org_metrics = (orgs.get(recommended_org) or {}).get("metrics")
+    except Exception:
+        org_metrics = None
+
+    entry = _best_pdf_entry_for_org(last, str(recommended_org) if recommended_org else None)
+
+    runs_for_entry = (entry or {}).get("runs") if isinstance(entry, dict) else None
+    if not isinstance(runs_for_entry, dict):
+        runs_for_entry = {}
+
+    hdfc_run = runs_for_entry.get("HDFC") if isinstance(runs_for_entry.get("HDFC"), dict) else None
+    enbd_run = runs_for_entry.get("ENBD") if isinstance(runs_for_entry.get("ENBD"), dict) else None
+
+    # Winner run is still used for legacy top-level flat fields.
+    winner_run = _winner_run_from_entry(entry)
+    ratio_map = _ratio_map_from_run(winner_run)
+
+    hdfc_fields = _extract_key_fields_from_run(hdfc_run)
+    enbd_fields = _extract_key_fields_from_run(enbd_run)
+
+    ratio_roa = None
+    ratio_roe = None
+    ratio_cost_to_income = None
+    ratio_npl_ratio = None
+    ratio_loan_to_deposit = None
+
+    if isinstance(org_metrics, dict):
+        ratio_roa = org_metrics.get("roa")
+        ratio_roe = org_metrics.get("roe")
+        ratio_cost_to_income = org_metrics.get("cost_to_income")
+        ratio_npl_ratio = org_metrics.get("asset_quality")
+        ratio_loan_to_deposit = org_metrics.get("loan_to_deposit")
+
+    # Coverage ratio isn't part of STANDARD_METRICS; try to locate from the chosen PDF ratios.
+    ratio_coverage_ratio = (
+        _find_ratio_value(ratio_map, "coverage", "ratio")
+        or _find_ratio_value(ratio_map, "provision", "coverage")
+        or _find_ratio_value(ratio_map, "coverage")
+    )
+
+    # Extracted raw values (heuristic key matching; uses chosen winner run for the recommended org).
+    income_total_operating_income = (
+        _find_value_in_run(winner_run, "total", "operating", "income")
+        or _find_value_in_run(winner_run, "operating", "income")
+        or _find_value_in_run(winner_run, "total", "income")
+        or _find_value_in_run(winner_run, "operating", "revenue")
+    )
+    income_profit_for_period = (
+        _find_value_in_run(winner_run, "profit", "period")
+        or _find_value_in_run(winner_run, "profit", "year")
+        or _find_value_in_run(winner_run, "net", "profit")
+        or _find_value_in_run(winner_run, "profit", "after", "tax")
+        or _find_value_in_run(winner_run, "net", "income")
+    )
+    bs_total_assets = (
+        _find_value_in_run(winner_run, "total", "assets")
+        or _find_value_in_run(winner_run, "assets")
+    )
+
+    # Provide a per-PDF breakdown as well (useful for n8n loops).
+    pdf_rows: List[Dict[str, Any]] = []
+    try:
+        for r in (last.get("results") or []):
+            runs = (r.get("runs") or {}) if isinstance(r, dict) else {}
+            h_run = runs.get("HDFC") if isinstance(runs, dict) and isinstance(runs.get("HDFC"), dict) else None
+            e_run = runs.get("ENBD") if isinstance(runs, dict) and isinstance(runs.get("ENBD"), dict) else None
+            h_fields = _extract_key_fields_from_run(h_run)
+            e_fields = _extract_key_fields_from_run(e_run)
+
+            rr = _winner_run_from_entry(r)
+            rm = _ratio_map_from_run(rr)
+            km = r.get("key_metrics") or {}
+            pdf_rows.append(
+                {
+                    "file_name": r.get("pdf_path"),
+                    "organisation": r.get("organisation"),
+                    "winner": r.get("winner"),
+                    "units": (rr or {}).get("units") if isinstance(rr, dict) else None,
+
+                    # Extractor-specific payloads (both extractors, regardless of winner)
+                    "hdfc": h_fields,
+                    "enbd": e_fields,
+
+                    # Also provide flattened extractor-specific fields for easy n8n sheet mapping
+                    "hdfc_income_total_operating_income": h_fields.get("income_total_operating_income"),
+                    "hdfc_income_profit_for_period": h_fields.get("income_profit_for_period"),
+                    "hdfc_bs_total_assets": h_fields.get("bs_total_assets"),
+                    "hdfc_ratio_roa": h_fields.get("ratio_roa"),
+                    "hdfc_ratio_roe": h_fields.get("ratio_roe"),
+                    "hdfc_ratio_cost_to_income": h_fields.get("ratio_cost_to_income"),
+                    "hdfc_ratio_npl_ratio": h_fields.get("ratio_npl_ratio"),
+                    "hdfc_ratio_coverage_ratio": h_fields.get("ratio_coverage_ratio"),
+                    "hdfc_ratio_loan_to_deposit": h_fields.get("ratio_loan_to_deposit"),
+
+                    "enbd_income_total_operating_income": e_fields.get("income_total_operating_income"),
+                    "enbd_income_profit_for_period": e_fields.get("income_profit_for_period"),
+                    "enbd_bs_total_assets": e_fields.get("bs_total_assets"),
+                    "enbd_ratio_roa": e_fields.get("ratio_roa"),
+                    "enbd_ratio_roe": e_fields.get("ratio_roe"),
+                    "enbd_ratio_cost_to_income": e_fields.get("ratio_cost_to_income"),
+                    "enbd_ratio_npl_ratio": e_fields.get("ratio_npl_ratio"),
+                    "enbd_ratio_coverage_ratio": e_fields.get("ratio_coverage_ratio"),
+                    "enbd_ratio_loan_to_deposit": e_fields.get("ratio_loan_to_deposit"),
+                    "income_total_operating_income": (
+                        _find_value_in_run(rr, "total", "operating", "income")
+                        or _find_value_in_run(rr, "operating", "income")
+                        or _find_value_in_run(rr, "total", "income")
+                    ),
+                    "income_profit_for_period": (
+                        _find_value_in_run(rr, "profit", "period")
+                        or _find_value_in_run(rr, "net", "profit")
+                        or _find_value_in_run(rr, "profit", "after", "tax")
+                    ),
+                    "bs_total_assets": (_find_value_in_run(rr, "total", "assets") or _find_value_in_run(rr, "assets")),
+                    "ratio_roa": km.get("roa") or _find_ratio_value(rm, "roa"),
+                    "ratio_roe": km.get("roe") or _find_ratio_value(rm, "roe"),
+                    "ratio_cost_to_income": km.get("cost_to_income") or _find_ratio_value(rm, "cost", "income"),
+                    "ratio_npl_ratio": km.get("asset_quality") or _find_ratio_value(rm, "npl") or _find_ratio_value(rm, "npa"),
+                    "ratio_coverage_ratio": (
+                        _find_ratio_value(rm, "coverage", "ratio")
+                        or _find_ratio_value(rm, "provision", "coverage")
+                        or _find_ratio_value(rm, "coverage")
+                    ),
+                    "ratio_loan_to_deposit": km.get("loan_to_deposit") or _find_ratio_value(rm, "loan", "deposit") or _find_ratio_value(rm, "ldr"),
+                }
+            )
+    except Exception:
+        pdf_rows = []
+
+    file_names: List[str] = []
+    try:
+        for r in (last.get("results") or []):
+            fp = (r.get("pdf_path") or "").strip()
+            if fp:
+                file_names.append(fp)
+    except Exception:
+        file_names = []
+
+    payload = {
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "source": "agentic_flow_ui",
+
+        # Flat keys (match your existing n8n sheet fields)
+        "company_name": recommended_org or "",
+        "quarter": "",
+        "industry": "",
+        "file_name": ", ".join(file_names) if file_names else "",
+
+        "income_total_operating_income": income_total_operating_income,
+        "income_profit_for_period": income_profit_for_period,
+        "bs_total_assets": bs_total_assets,
+
+        "ratio_roa": ratio_roa,
+        "ratio_roe": ratio_roe,
+        "ratio_cost_to_income": ratio_cost_to_income,
+        "ratio_npl_ratio": ratio_npl_ratio,
+        "ratio_coverage_ratio": ratio_coverage_ratio,
+        "ratio_loan_to_deposit": ratio_loan_to_deposit,
+
+        # Explicit extractor splits (same fields for both HDFC + ENBD)
+        "hdfc_income_total_operating_income": hdfc_fields.get("income_total_operating_income"),
+        "hdfc_income_profit_for_period": hdfc_fields.get("income_profit_for_period"),
+        "hdfc_bs_total_assets": hdfc_fields.get("bs_total_assets"),
+        "hdfc_ratio_roa": hdfc_fields.get("ratio_roa"),
+        "hdfc_ratio_roe": hdfc_fields.get("ratio_roe"),
+        "hdfc_ratio_cost_to_income": hdfc_fields.get("ratio_cost_to_income"),
+        "hdfc_ratio_npl_ratio": hdfc_fields.get("ratio_npl_ratio"),
+        "hdfc_ratio_coverage_ratio": hdfc_fields.get("ratio_coverage_ratio"),
+        "hdfc_ratio_loan_to_deposit": hdfc_fields.get("ratio_loan_to_deposit"),
+
+        "enbd_income_total_operating_income": enbd_fields.get("income_total_operating_income"),
+        "enbd_income_profit_for_period": enbd_fields.get("income_profit_for_period"),
+        "enbd_bs_total_assets": enbd_fields.get("bs_total_assets"),
+        "enbd_ratio_roa": enbd_fields.get("ratio_roa"),
+        "enbd_ratio_roe": enbd_fields.get("ratio_roe"),
+        "enbd_ratio_cost_to_income": enbd_fields.get("ratio_cost_to_income"),
+        "enbd_ratio_npl_ratio": enbd_fields.get("ratio_npl_ratio"),
+        "enbd_ratio_coverage_ratio": enbd_fields.get("ratio_coverage_ratio"),
+        "enbd_ratio_loan_to_deposit": enbd_fields.get("ratio_loan_to_deposit"),
+
+        # Extra structured data for richer automations
+        "recommended_organisation": recommended_org,
+        "pdf_count": last.get("pdf_count"),
+        "pdfs": pdf_rows,
+        "result": _sanitize_result_for_export(last),
+    }
+
+    out = _http_post_json(url, payload)
+    body_text = (out.get("body") or "")
+
+    response_json = None
+    try:
+        response_json = json.loads(body_text)
+    except Exception:
+        response_json = None
+
+    ok = bool(out.get("ok"))
+    status = int(out.get("status") or 0)
+    resp = {
+        "ok": ok,
+        "status": status,
+        "webhook_url": url,
+        "response_json": response_json,
+        "response_text": body_text[:8000],
+    }
+
+    return jsonify(resp), (200 if ok else 502)
 
 
 @app.route("/api/chat", methods=["POST"])
